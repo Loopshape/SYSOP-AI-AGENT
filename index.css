@@ -1,0 +1,244 @@
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+:root {
+  --background-color: #121212;
+  --surface-color: #1e1e1e;
+  --primary-text-color: #e0e0e0;
+  --secondary-text-color: #b0b0b0;
+  --accent-color: #00ff9d;
+  --user-message-bg: #2a2a2a;
+  --ai-message-bg: #1e1e1e;
+  --error-color: #ff5252;
+  --font-family: 'Roboto Mono', monospace;
+  --border-radius: 8px;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+  background-color: var(--background-color);
+  color: var(--primary-text-color);
+  font-family: var(--font-family);
+  font-size: 16px;
+  line-height: 1.6;
+  overflow: hidden;
+}
+
+#app-container {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  width: 100%;
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+#output {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1rem;
+  scrollbar-width: thin;
+  scrollbar-color: var(--accent-color) var(--surface-color);
+}
+
+.message-container {
+  display: flex;
+  margin-bottom: 1rem;
+  max-width: 95%;
+}
+
+.message {
+  padding: 0.75rem 1rem;
+  border-radius: var(--border-radius);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+}
+
+.user-message-container {
+  justify-content: flex-end;
+}
+
+.user-message {
+  background-color: var(--user-message-bg);
+  color: var(--primary-text-color);
+  border-bottom-right-radius: 0;
+}
+
+.ai-message-container {
+  justify-content: flex-start;
+}
+
+.ai-message {
+  background-color: var(--ai-message-bg);
+  color: var(--primary-text-color);
+  border-bottom-left-radius: 0;
+}
+
+.ai-message::before {
+  content: '[AI] > ';
+  font-weight: bold;
+  color: var(--accent-color);
+  display: block;
+  margin-bottom: 0.5rem;
+}
+
+.user-message-container::before {
+    content: '<USER> ';
+    font-weight: bold;
+    color: var(--secondary-text-color);
+    align-self: flex-start;
+    margin-right: 0.5rem;
+    margin-top: 0.5rem;
+}
+
+.user-message-container {
+    align-items: flex-start;
+    flex-direction: row-reverse;
+}
+
+.user-message {
+    flex-grow: 0;
+}
+
+
+/* Markdown styles */
+.ai-message p {
+  margin-bottom: 1rem;
+}
+
+.ai-message h1,
+.ai-message h2,
+.ai-message h3 {
+  color: var(--accent-color);
+  margin-top: 1.5rem;
+  margin-bottom: 1rem;
+  border-bottom: 1px solid var(--surface-color);
+  padding-bottom: 0.3rem;
+}
+
+.ai-message ul,
+.ai-message ol {
+  padding-left: 1.5rem;
+  margin-bottom: 1rem;
+}
+
+.ai-message code {
+  background-color: rgba(255, 255, 255, 0.1);
+  padding: 0.2em 0.4em;
+  margin: 0;
+  font-size: 85%;
+  border-radius: 3px;
+  font-family: 'Fira Code', var(--font-family);
+}
+
+.ai-message pre {
+  background-color: #0d0d0d;
+  border: 1px solid var(--surface-color);
+  padding: 1rem;
+  border-radius: var(--border-radius);
+  overflow-x: auto;
+  margin-bottom: 1rem;
+}
+
+.ai-message pre code {
+  background-color: transparent;
+  padding: 0;
+}
+
+.ai-message a {
+  color: var(--accent-color);
+  text-decoration: none;
+}
+.ai-message a:hover {
+  text-decoration: underline;
+}
+
+.ai-message blockquote {
+    border-left: 4px solid var(--accent-color);
+    padding-left: 1rem;
+    margin: 1rem 0;
+    color: var(--secondary-text-color);
+}
+
+
+#prompt-form {
+  display: flex;
+  align-items: flex-end;
+  padding: 1rem;
+  gap: 0.5rem;
+  border-top: 1px solid var(--surface-color);
+  background-color: var(--background-color);
+}
+
+#prompt-input {
+  flex: 1;
+  background-color: var(--surface-color);
+  color: var(--primary-text-color);
+  border: 1px solid var(--surface-color);
+  border-radius: var(--border-radius);
+  padding: 0.75rem;
+  font-family: var(--font-family);
+  font-size: 1rem;
+  resize: none;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+#prompt-input:focus {
+  outline: none;
+  border-color: var(--accent-color);
+  box-shadow: 0 0 0 2px rgba(0, 255, 157, 0.2);
+}
+
+#prompt-form button {
+  background-color: var(--accent-color);
+  border: none;
+  border-radius: var(--border-radius);
+  padding: 0.6rem;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background-color 0.2s ease;
+  height: 48px;
+  width: 48px;
+}
+
+#prompt-form button:hover {
+  background-color: #00e68a;
+}
+
+#prompt-form button svg {
+  width: 24px;
+  height: 24px;
+  fill: var(--background-color);
+}
+
+.error {
+  color: var(--error-color);
+  text-align: center;
+  padding: 1rem;
+}
+
+/* Loading indicator */
+.loading .blinking-cursor {
+    display: inline-block;
+    width: 10px;
+    height: 1.2rem;
+    background-color: var(--accent-color);
+    animation: blink 1s step-end infinite;
+}
+
+@keyframes blink {
+    from, to { background-color: transparent }
+    50% { background-color: var(--accent-color); }
+}

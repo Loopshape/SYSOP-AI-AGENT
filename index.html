@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>AI DevOps Assistant</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="stylesheet" href="index.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "marked": "https://esm.sh/marked@^15.0.8",
+          "@google/genai": "https://esm.sh/@google/genai"
+        }
+      }
+    </script>
+    <script type="module" src="index.tsx"></script>
+  </head>
+  <body>
+    <main id="app-container">
+      <div id="output"></div>
+      <form id="prompt-form" aria-label="Chat input form">
+        <textarea
+          name="prompt"
+          id="prompt-input"
+          placeholder="Ask your AI DevOps assistant..."
+          aria-label="Enter your prompt"
+          rows="1"
+        ></textarea>
+        <button type="submit" aria-label="Send message">
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="currentColor"
+          >
+            <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
+          </svg>
+        </button>
+      </form>
+    </main>
+  </body>
+</html>
