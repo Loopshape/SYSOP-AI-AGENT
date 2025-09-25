@@ -1,0 +1,272 @@
+#!/usr/bin/env bash
+# ai.sh - AI DevOps Platform v13.1 - The Robust Monolith Edition
+# A single-file, full-stack application combining a Bash agent with an embedded Node.js/HTML5 web UI.
+
+# --- BASH AGENT & CLI DISPATCHER ---
+# This part of the script runs if not called with 'serve'
+
+# FIX: Correctly check the first argument to see if we should delegate to Node.js
+if [[ "${1:-}" == "serve" ]]; then
+    # Check for Node.js before attempting to execute
+    if ! command -v node &>/dev/null; then
+        echo "ERROR: Node.js is required for 'serve' mode." >&2
+        echo "Please install Node.js (e.g., 'sudo apt-get install nodejs npm')." >&2
+        exit 1
+    fi
+    # Use 'exec' to replace the bash process with the node process.
+    # The '--' tells node to stop parsing its own options.
+    exec node --input-type=module - "$0" "$@" <<'NODE_JS_SERVER_EOF'
+// --- NODE.JS SERVER & WEB UI SECTION ---
+import http from 'http';
+import { exec } from 'child_process';
+
+const PORT = process.env.AI_PORT || 8080;
+// The first argument passed from Bash is the path to the script itself.
+const AI_SCRIPT_PATH = process.argv[2];
+
+const server = http.createServer((req, res) => {
+    if (req.url === '/' && req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.end(getHtmlApp());
+    } else if (req.url === '/api/v1/run' && req.method === 'POST') {
+        let body = '';
+        req.on('data', chunk => { body += chunk.toString(); });
+        req.on('end', () => {
+            try {
+                const { command, args } = JSON.parse(body);
+                const sanitizedArgs = args.map(arg => `'${arg.replace(/'/g, "'\\''")}'`).join(' ');
+                const fullCommand = `${AI_SCRIPT_PATH} ${command} ${sanitizedArgs}`;
+
+                console.log(`[API] Executing: ${fullCommand}`);
+
+                exec(fullCommand, { timeout: 300000 }, (error, stdout, stderr) => { // 5 minute timeout
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    if (error) {
+                        res.end(JSON.stringify({ success: false, output: `Error: ${error.message}\n${stderr}` }));
+                        return;
+                    }
+                    res.end(JSON.stringify({ success: true, output: stdout }));
+                });
+            } catch (e) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ success: false, output: 'Invalid JSON payload.' }));
+            }
+        });
+    } else {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Not Found' }));
+    }
+});
+
+server.listen(PORT, () => {
+    console.log(`AI DevOps Platform Web UI running at http://localhost:${PORT}`);
+    console.log('Press Ctrl+C to stop the server.');
+});
+
+function getHtmlApp() {
+    return `
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI DevOps Platform</title>
+    <style>
+        :root {
+            --bg-color: #272822; --fg-color: #F8F8F2; --comment-color: #75715E;
+            --pink: #F92672; --green: #A6E22E; --yellow: #E6DB74; --blue: #66D9EF;
+        }
+        body { margin: 0; font-family: 'Consolas', 'Monaco', monospace; background-color: var(--bg-color); color: var(--fg-color); font-size: 16px; }
+        .container { max-width: 1200px; margin: 2rem auto; padding: 1rem; }
+        header { text-align: center; border-bottom: 1px solid var(--comment-color); padding-bottom: 1rem; margin-bottom: 2rem; }
+        header h1 { color: var(--green); margin: 0; }
+        .tabs { display: flex; border-bottom: 1px solid var(--comment-color); margin-bottom: 2rem; }
+        .tab-button { padding: 1rem 1.5rem; cursor: pointer; background: none; border: none; color: var(--fg-color); font-size: 1rem; opacity: 0.6; }
+        .tab-button.active { opacity: 1; border-bottom: 2px solid var(--pink); }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        textarea { width: 100%; background-color: #3e3d32; border: 1px solid var(--comment-color); color: var(--fg-color); padding: 0.75rem; border-radius: 4px; font-family: inherit; box-sizing: border-box; min-height: 150px; }
+        button { background-color: var(--pink); color: var(--fg-color); border: none; padding: 0.75rem 1.5rem; border-radius: 4px; font-size: 1rem; cursor: pointer; transition: background-color 0.3s ease; }
+        button:hover { background-color: #ff5e9a; }
+        #output-container { margin-top: 2rem; background-color: #33342b; border-radius: 4px; padding: 1rem; opacity: 0; transform: translateY(20px); }
+        #output-container h3 { margin-top: 0; color: var(--blue); }
+        #output { white-space: pre-wrap; word-wrap: break-word; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.7.1/jquery.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
+</head>
+<body>
+    <div class="container">
+        <header><h1>AI DevOps Platform</h1></header>
+        <div class="tabs">
+            <button class="tab-button active" data-tab="agent">Agent</button>
+            <button class="tab-button" data-tab="git">Git Assistant</button>
+        </div>
+        <div id="agent" class="tab-content active">
+            <h2>Autonomous Agent</h2>
+            <textarea id="agent-prompt" placeholder="e.g., Create a python script that prints 'hello world' and a test for it."></textarea>
+            <button id="run-agent">Execute Task</button>
+        </div>
+        <div id="git" class="tab-content">
+            <h2>Git Assistant</h2>
+            <button class="git-op" data-op="status">Status</button>
+        </div>
+        <div id="output-container">
+            <h3>Agent Output</h3>
+            <pre><code id="output"></code></pre>
+        </div>
+    </div>
+    <script>
+        $(document).ready(function() {
+            $('.tab-button').on('click', function() {
+                const tabId = $(this).data('tab');
+                $('.tab-button, .tab-content').removeClass('active');
+                $(this).add('#' + tabId).addClass('active');
+            });
+            function callApi(command, args = []) {
+                $('#output').text('Agent is thinking...');
+                gsap.to("#output-container", { autoAlpha: 1, y: 0, duration: 0.5 });
+                fetch('/api/v1/run', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ command, args })
+                })
+                .then(res => res.json())
+                .then(data => { $('#output').text(data.output); })
+                .catch(err => { $('#output').text('API call failed: ' + err); });
+            }
+            $('#run-agent').on('click', () => {
+                const prompt = $('#agent-prompt').val();
+                if (prompt) callApi('agent', [prompt]);
+            });
+            $('.git-op').on('click', function() {
+                callApi('git', [$(this).data('op')]);
+            });
+        });
+    </script>
+</body>
+</html>
+    `;
+}
+NODE_JS_SERVER_EOF
+# FIX: The here-document terminator MUST be at the beginning of the line.
+# The 'if' statement from line 9 is now correctly closed.
+fi
+
+# --- BASH AGENT (v10.1) ---
+set -euo pipefail
+IFS=$'\n\t'
+
+# --- CONFIGURATION ---
+AI_HOME="${AI_HOME:-$HOME/.ai_agent}"
+PROJECTS_DIR="${PROJECTS_DIR:-$HOME/ai_projects}"
+DEFAULT_AGENT_MODEL="llama3.1:8b"
+AGENT_MODEL=""
+OLLAMA_BIN="$(command -v ollama || true)"
+MEMORY_DB="$AI_HOME/memory.db"
+CONFIG_DB="$AI_HOME/config.db"
+MAX_AGENT_LOOPS=5
+
+# --- COLORS & LOGGING ---
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'; NC='\033[0m'
+log() { printf "${BLUE}[%s]${NC} %s\n" "$(date '+%T')" "$*"; }
+log_success() { log "${GREEN}$*${NC}"; }
+log_warn() { log "${YELLOW}WARN: $*${NC}"; }
+log_error() { log "${RED}ERROR: $*${NC}"; exit 1; }
+log_info() { log "${CYAN}$*${NC}"; }
+log_phase() { echo -e "\n${PURPLE}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}"; log "${PURPLE}$*${NC}"; }
+
+# --- BOOTSTRAP & DB ---
+mkdir -p "$AI_HOME" "$PROJECTS_DIR"
+init_db() {
+    sqlite3 "$MEMORY_DB" "CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY, prompt TEXT, result TEXT, status TEXT);" 2>/dev/null || true
+    sqlite3 "$CONFIG_DB" "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);" 2>/dev/null || true
+}
+sqlite_escape() { echo "$1" | sed "s/'/''/g"; }
+set_config() { sqlite3 "$CONFIG_DB" "INSERT OR REPLACE INTO config (key, value) VALUES ('$(sqlite_escape "$1")', '$(sqlite_escape "$2")');"; }
+get_config() { sqlite3 "$CONFIG_DB" "SELECT value FROM config WHERE key = '$(sqlite_escape "$1")';" 2>/dev/null; }
+load_config_values() { AGENT_MODEL=$(get_config agent_model || echo "$DEFAULT_AGENT_MODEL"); }
+
+# --- AI INTERACTION & TOOLS ---
+ensure_ollama_server() { if ! pgrep -f "ollama serve" >/dev/null; then log "Ollama starting..."; nohup "$OLLAMA_BIN" serve >/dev/null 2>&1 & sleep 3; fi; }
+run_model_streaming() {
+    local model="$1" prompt="$2"; ensure_ollama_server
+    if ! "$OLLAMA_BIN" list | grep -q "^${model}"; then log "Model $model not found. Pulling..."; "$OLLAMA_BIN" pull "$model"; fi
+    "$OLLAMA_BIN" run "$model" "$prompt"
+}
+confirm_action() { echo -e "\n${YELLOW}PROPOSED ACTION:${NC} ${CYAN}$1${NC}"; read -p "Approve? [y/N] " -n 1 -r c; echo; [[ "$c" =~ ^[Yy]$ ]]; }
+tool_run_command() { if confirm_action "Run command: $2"; then (cd "$1" && eval "$2") 2>&1 || true; else echo "User aborted."; return 1; fi; }
+
+# --- CODER-AGI WORKFLOW ---
+run_coder_agi_agent() {
+    local user_prompt="$*"
+    local project_name; project_name=$(echo "$user_prompt" | tr ' ' '-' | tr -cd 'a-zA-Z0-9-' | cut -c1-32)
+    local project_dir="$PROJECTS_DIR/$project_name"; mkdir -p "$project_dir"; cd "$project_dir"
+    log_success "Created project workspace: $project_dir"
+
+    local language; language=$(run_model_streaming "$AGENT_MODEL" "Detect programming language from prompt. Output ONLY the name. Prompt: $user_prompt")
+    local main_file="main.${language/javascript/js}"; local test_file="test_main.${language/javascript/js}"
+    log_info "Detected language: $language. Main file: '$main_file'"
+
+    local code="" review="" tests="" test_output="" status="IN_PROGRESS"
+    for (( i=1; i<=MAX_AGENT_LOOPS; i++ )); do
+        log_phase "Coder-AGI Loop $i/$MAX_AGENT_LOOPS"
+        code=$(run_model_streaming "$AGENT_MODEL" "You are CODER. Write code for '$main_file'. Output ONLY code. Request: $user_prompt. Feedback: ${review:-None}. Test Errors: ${test_output:-None}")
+        echo "$code" > "$main_file"
+        review=$(run_model_streaming "$AGENT_MODEL" "You are REVIEWER. Critique this code. If perfect, respond ONLY with 'LGTM'. Code:\n$code")
+        if [[ "$review" != "LGTM" ]]; then
+            code=$(run_model_streaming "$AGENT_MODEL" "You are CODER. Refactor based on review. Output ONLY code.\nReview:\n$review\nCode:\n$code")
+            echo "$code" > "$main_file"
+        fi
+        tests=$(run_model_streaming "$AGENT_MODEL" "You are TESTER. Write a test script for '$test_file'. Output ONLY code.\nCode:\n$code")
+        echo "$tests" > "$test_file"
+        
+        log_phase "VERIFICATION"
+        local test_cmd=""; case "$language" in python) test_cmd="pip install pytest > /dev/null && python3 -m pytest $test_file";; javascript) test_cmd="npm install jest > /dev/null && npx jest $test_file";; *) status="MANUAL_VERIFICATION"; break;; esac
+        test_output=$(tool_run_command "$project_dir" "$test_cmd")
+        
+        if [[ $? -eq 0 && ! "$test_output" =~ "failed" && ! "$test_output" =~ "FAIL" ]]; then
+            log_success "All tests passed!"; status="SUCCESS"; break
+        else
+            log_warn "Tests failed. Retrying."; status="TESTS_FAILED"
+        fi
+    done
+    log_phase "AGENT FINISHED - FINAL STATUS: $status"
+}
+
+# --- GIT ASSISTANT ---
+git_operation() {
+    local op="$1" path="${2:-.}"; if [[ ! -d "$path/.git" ]]; then log_error "Not a git repo: $path"; fi; cd "$path";
+    log_phase "Git $op"; git "$op"
+}
+
+# --- HELP & BASH MAIN DISPATCHER ---
+show_help() {
+    printf "${GREEN}AI DevOps Platform v13.1 - The Robust Monolith${NC}\n\n"
+    printf "A single-file, full-stack AI agent with an embedded web UI.\n\n"
+    printf "${CYAN}MODES OF OPERATION:${NC}\n"
+    printf "  ${GREEN}ai serve${NC}                  Start the web UI server on http://localhost:8080\n"
+    printf "  ${GREEN}ai agent \"prompt\"${NC}         (Default) Run the autonomous Coder-AGI in the terminal.\n"
+    printf "  ${GREEN}ai git <op>${NC}                Run the Git Assistant in the terminal.\n\n"
+    printf "${CYAN}UTILITY COMMANDS:${NC}\n"
+    printf "  ${GREEN}ai --setup${NC}                Installs all dependencies (Bash & Node.js).\n"
+    printf "  ${GREEN}ai --help${NC}                 Show this help message.\n\n"
+}
+
+main() {
+    init_db; load_config_values
+    if [[ $# -eq 0 ]]; then show_help; exit 0; fi
+    case "${1:-}" in
+        --setup)
+            log_info "Setting up environment..."
+            if command -v apt-get &>/dev/null; then sudo apt-get update && sudo apt-get install -y sqlite3 git tree npm; fi
+            set_config agent_model "$DEFAULT_AGENT_MODEL"
+            log_success "Setup complete." ;;
+        --help|-h) show_help ;;
+        agent) shift; run_coder_agi_agent "$@" ;;
+        git) shift; git_operation "$@" ;;
+        *) run_coder_agi_agent "$@" ;;
+    esac
+}
+
+main "$@"
