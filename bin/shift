@@ -1,0 +1,77 @@
+#!/usr/bin/env zsh
+# mex - AI multi-pane agent launcher with auto Git sync
+
+AI_HOME="${AI_HOME:-$HOME/.ai_agent}"
+PROJECTS_DIR="${PROJECTS_DIR:-$HOME/ai_projects}"
+REPO_DIR="$PROJECTS_DIR"
+SCREEN_SESSION="mex_ai"
+
+mkdir -p "$AI_HOME" "$PROJECTS_DIR"
+
+# --- Colors ---
+RED='%F{red}'; GREEN='%F{green}'; YELLOW='%F{yellow}'; BLUE='%F{blue}'; CYAN='%F{cyan}'; NC='%f'
+
+log() { echo "${BLUE}[$(date '+%H:%M:%S')]${NC} $*"; }
+log_info() { echo "${CYAN}[INFO]${NC} $*"; }
+log_success() { echo "${GREEN}[OK]${NC} $*"; }
+log_warn() { echo "${YELLOW}[WARN]${NC} $*"; }
+
+# --- Git helpers ---
+git_pull_repo() {
+    if [[ -d "$REPO_DIR/.git" ]]; then
+        log_info "Pulling latest changes..."
+        git -C "$REPO_DIR" pull
+    fi
+}
+
+git_push_repo() {
+    if [[ -d "$REPO_DIR/.git" ]]; then
+        log_info "Pushing changes..."
+        git -C "$REPO_DIR" add .
+        git -C "$REPO_DIR" commit -m "mex auto-update $(date '+%Y-%m-%d %H:%M:%S')" || log_info "Nothing to commit"
+        git -C "$REPO_DIR" push origin main
+    fi
+}
+
+# --- Launch AI agent in screen panes ---
+launch_agent_screen() {
+    local user_prompt="$1"
+    
+    # Pull latest repo before starting
+    git_pull_repo
+
+    # Start screen session
+    screen -dmS $SCREEN_SESSION
+
+    # Pane 0 - Messenger
+    screen -S $SCREEN_SESSION -X screen -t MESSENGER bash -c "source ~/.zshrc; ai.sh \"$user_prompt\" --messenger; exec zsh"
+
+    # Pane 1 - Combinator
+    screen -S $SCREEN_SESSION -X screen -t COMBINATOR bash -c "source ~/.zshrc; ai.sh \"$user_prompt\" --combinator; exec zsh"
+
+    # Pane 2 - Trader
+    screen -S $SCREEN_SESSION -X screen -t TRADER bash -c "source ~/.zshrc; ai.sh \"$user_prompt\" --trader; exec zsh"
+
+    # Optional: Split windows horizontally
+    screen -S $SCREEN_SESSION -X select 0
+    screen -S $SCREEN_SESSION -X split
+    screen -S $SCREEN_SESSION -X focus down
+    screen -S $SCREEN_SESSION -X select 2
+    screen -S $SCREEN_SESSION -X split
+    screen -S $SCREEN_SESSION -X focus down
+
+    log_success "AI agent launched in screen session: $SCREEN_SESSION"
+    log_info "Attach with: screen -r $SCREEN_SESSION"
+}
+
+# --- Main ---
+if [[ $# -lt 1 ]]; then
+    echo "Usage: mex \"<your task prompt>\""
+    exit 1
+fi
+
+USER_PROMPT="$*"
+launch_agent_screen "$USER_PROMPT"
+
+# Auto push after session ends (monitoring could be added)
+# For now, instruct user to detach and push manually, or cron hook can be added

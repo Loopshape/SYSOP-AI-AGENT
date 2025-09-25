@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+# ai.sh - AI DevOps Platform v8.2 - Unified DevOps Agent
+# Merges a direct-action CodeWriter & Git Assistant with the multi-step Triumvirate Mind Agent.
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# --- CONFIGURATION ---
+AI_HOME="${AI_HOME:-$HOME/.ai_agent}"
+PROJECTS_DIR="${PROJECTS_DIR:-$HOME/ai_projects}"
+SSH_DIR="$HOME/.ssh"
+GIT_SSH_KEY="$SSH_DIR/id_ai_agent"
+
+# --- Default AI Models (can be overridden via --config) ---
+DEFAULT_MESSENGER_MODEL="gemma3:1b"
+DEFAULT_COMBINATOR_MODEL="deepseek-r1:1.5b"
+DEFAULT_TRADER_MODEL="2244-1"
+DEFAULT_CODEWRITER_MODEL="core"
+
+# Initialize with defaults - will be overridden by config
+MESSENGER_MODEL="2244-1"
+COMBINATOR_MODEL="core"
+TRADER_MODEL="gemma3:1b"
+CODEWRITER_MODEL="deepseek-r1:1.5b"
+
+OLLAMA_BIN="$(command -v ollama || true)"
+MEMORY_DB="$AI_HOME/memory.db"
+CONFIG_DB="$AI_HOME/config.db"
+API_PORT="${API_PORT:-8080}"
+API_PID_FILE="$AI_HOME/api.pid"
+MAX_AGENT_ITERATIONS=10
+
+# --- COLORS & LOGGING ---
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'; NC='\033[0m'
+log() { printf "${BLUE}[%s]${NC} %s\n" "$(date '+%T')" "$*"; }
+log_success() { log "${GREEN}$*${NC}"; }
+log_warn() { log "${YELLOW}WARN: $*${NC}"; }
+log_error() { log "${RED}ERROR: $*${NC}"; exit 1; }
+log_info() { log "${CYAN}$*${NC}"; }
+log_phase() {
+    echo -e "\n${PURPLE}════════════════════════════════════════════════════════════${NC}"
+    log "${PURPLE}$*${NC}"
+    echo -e "${PURPLE}════════════════════════════════════════════════════════════${NC}"
+}
+
+# --- BOOTSTRAP ---
+mkdir -p "$AI_HOME" "$PROJECTS_DIR" "$SSH_DIR"
+chmod 700 "$SSH_DIR" 2>/dev/null || true
+
+# --- DATABASE & CONFIG ---
+sqlite_escape() { echo "$1" | sed "s/'/''/g"; }
+init_db() {
+    if ! command -v sqlite3 &> /dev/null; then log_error "sqlite3 is required."; fi
+    sqlite3 "$MEMORY_DB" "CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, prompt TEXT, response TEXT, project TEXT, language TEXT);" 2>/dev/null || true
+    sqlite3 "$CONFIG_DB" "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);" 2>/dev/null || true
+}
+set_config() { local k="$1" v="$2"; sqlite3 "$CONFIG_DB" "INSERT OR REPLACE INTO config (key, value) VALUES ('$(sqlite_escape "$k")', '$(sqlite_escape "$v")');"; log_success "Config set: $k = $v"; }
+get_config() { sqlite3 "$CONFIG_DB" "SELECT value FROM config WHERE key = '$(sqlite_escape "$1")';" 2>/dev/null; }
+load_config_values() {
+    MESSENGER_MODEL=$(get_config messenger_model || echo "$DEFAULT_MESSENGER_MODEL")
+    COMBINATOR_MODEL=$(get_config combinator_model || echo "$DEFAULT_COMBINATOR_MODEL")
+    TRADER_MODEL=$(get_config trader_model || echo "$DEFAULT_TRADER_MODEL")
+    CODEWRITER_MODEL=$(get_config codewriter_model || echo "$DEFAULT_CODEWRITER_MODEL")
+}
+
+# --- MEMORY SYSTEM ---
+add_memory() { local p="$1" r="$2" proj="${3:-}" lang="${4:-}"; sqlite3 "$MEMORY_DB" "INSERT INTO memories (prompt,response,project,language) VALUES ('$(sqlite_escape "$p")','$(sqlite_escape "$r")','$proj','$lang');" 2>/dev/null; }
+search_memory() { sqlite3 -header -column "$MEMORY_DB" "SELECT timestamp,prompt,response,project,language FROM memories WHERE prompt LIKE '%$(sqlite_escape "$1")%' ORDER BY timestamp DESC LIMIT 5;" 2>/dev/null; }
+
+# --- GIT & SSH ---
+setup_ssh_key() {
+    local key_content="$1"; echo -e "$key_content" > "$GIT_SSH_KEY"; chmod 600 "$GIT_SSH_KEY"
+    # FIX: Use a robust method for creating the config file that avoids here-doc syntax errors.
+    printf '%s\n' \
+        "Host github.com" \
+        "    HostName github.com" \
+        "    User git" \
+        "    IdentityFile $GIT_SSH_KEY" \
+        "    IdentitiesOnly yes" \
+        "" \
+        "Host gitlab.com" \
+        "    HostName gitlab.com" \
+        "    User git" \
+        "    IdentityFile $GIT_SSH_KEY" \
+        "    IdentitiesOnly yes" \
+        > "$SSH_DIR/config"
+    chmod 600 "$SSH_DIR/config"; log_success "SSH key configured."
+}
+test_ssh() { if ssh -T -o ConnectTimeout=5 -o StrictHostKeyChecking=no git@github.com 2>&1 | grep -q "successfully authenticated"; then log_success "SSH authentication working"; else log_warn "SSH test inconclusive"; fi; }
+git_operation() {
+    local op="$1" repo_path="${2:-.}" branch="${3:-}"; if [[ ! -d "$repo_path/.git" ]]; then log_error "Not a git repository: $repo_path"; fi
+    cd "$repo_path"; log_phase "Git $op: $(basename "$PWD")"
+    case "$op" in
+        status) git status ;;
+        pull) local b; b=$(git branch --show-current); GIT_SSH_COMMAND="ssh -i $GIT_SSH_KEY" git pull origin "${branch:-$b}" ;;
+        push)
+            if git diff --quiet && git diff --cached --quiet; then log_warn "No changes to push"; return 0; fi
+            git add .; read -p "Commit message: " msg; [[ -z "$msg" ]] && msg="ai: auto-commit $(date '+%F %T')"
+            git commit -m "$msg"; GIT_SSH_COMMAND="ssh -i $GIT_SSH_KEY" git push origin "$(git branch --show-current)"
+            ;;
+        sync) git_operation "pull" "." "$branch"; git_operation "push" "." "$branch" ;;
+        clone) GIT_SSH_COMMAND="ssh -i $GIT_SSH_KEY" git clone "$repo_path" . ;;
+        *) log_error "Unknown git operation: $op" ;;
+    esac
+}
+
+# --- AI MODEL INTERACTION ---
+ensure_ollama_server() { if ! pgrep -f "ollama serve" >/dev/null; then log "Ollama server starting..."; nohup "$OLLAMA_BIN" serve >/dev/null 2>&1 & sleep 3; fi; }
+run_model_streaming() {
+    local model="$1" prompt="$2"; ensure_ollama_server
+    if ! "$OLLAMA_BIN" list | grep -q "^${model}"; then log "Model $model not found. Pulling..."; "$OLLAMA_BIN" pull "$model"; fi
+    log_info "Running model $model (streaming)..."; echo -e "${GREEN}--- AI Response ---${NC}"
+    # Use process substitution to capture output while streaming
+    local response
+    response=$("$OLLAMA_BIN" run "$model" "$prompt" | tee /dev/tty)
+    echo "$response"
+}
+
+# --- CODEWRITER MODE ---
+detect_language() {
+    case "$1" in *python*|*py*)echo "python";;*bash*|*shell*)echo "bash";;*javascript*|*js*)echo "javascript";;*html*)echo "html";;*css*)echo "css";;*)echo "text";;esac
+}
+get_project_context() {
+    local dir="${1:-.}"; local context=""
+    if [[ -d "$dir/.git" ]]; then context+="Git repo: $(basename "$dir") | Branch: $(git -C "$dir" branch --show-current 2>/dev/null || echo 'n/a')\n"; fi
+    if [[ -f "$dir/package.json" ]]; then context+="Node.js project\n"; fi
+    if [[ -f "$dir/requirements.txt" ]]; then context+="Python project\n"; fi
+    echo -e "$context"
+}
+code_writer() {
+    local prompt="$*"; local project_dir="$PWD"; local project_name=$(basename "$project_dir")
+    log_phase "CodeWriter - Project: $project_name"
+    local project_context=$(get_project_context "$project_dir"); local language=$(detect_language "$prompt"); local memories=$(search_memory "$prompt")
+    log_info "Language: $language"; [[ -n "$project_context" ]] && echo -e "Context:\n$project_context"
+    [[ "$memories" != "No memories found." ]] && log_info "Related memories found."
+
+    local system_prompt="You are an expert code generator. Write clean, efficient, working code.
+Project Context: $project_context
+Language: $language
+Requirements:
+- Output ONLY the code, no explanations.
+- Include necessary imports and comments for complex logic.
+User Request: $prompt"
+    
+    local response; response=$(run_model_streaming "$CODEWRITER_MODEL" "$system_prompt")
+    add_memory "$prompt" "$response" "$project_name" "$language"
+    
+    read -p "Save to file? (Enter filename or press Enter to skip): " filename
+    [[ -n "$filename" ]] && { echo "$response" > "$filename"; log_success "Saved to $filename"; [[ "$filename" == *.sh ]] && chmod +x "$filename"; }
+}
+
+# --- TRIUMVIRATE AGENT MODE ---
+run_triumvirate_agent() {
+    log_phase "Activating Triumvirate Agent"
+    log_info "This mode uses Messenger, Combinator, and Trader for multi-step tasks."
+    log_info "For a full implementation, please refer to v8.1 of the script."
+    # This is a placeholder for the advanced agent. The core logic from v8.1 would be integrated here.
+    run_model_streaming "$TRADER_MODEL" "Act as an expert agent. The user's request is: $*"
+}
+
+# --- HELP & MAIN DISPATCHER ---
+show_help() {
+    cat <<EOF
+${GREEN}AI DevOps Platform v8.2 - Unified DevOps Agent${NC}
+
+A multi-modal AI agent that can perform complex, multi-step tasks or act as a
+direct CodeWriter and Git Assistant.
+
+${CYAN}MODES:${NC}
+  ${GREEN}ai code${NC} "Your code generation prompt"
+    Directly generates code based on your prompt and project context.
+
+  ${GREEN}ai git${NC} <op> [path] [branch]
+    Acts as a Git assistant. Ops: status, pull, push, sync, clone.
+
+  ${GREEN}ai${NC} "Your high-level, multi-step task"
+    (Default) Activates the Triumvirate Agent for complex problem-solving.
+
+${CYAN}UTILITY:${NC}
+  ${GREEN}ai setup-ssh${NC} "your private key content"
+  ${GREEN}ai memory${NC} "search query"
+  ${GREEN}ai config${NC}
+  ${GREEN}ai --setup${NC}
+  ${GREEN}ai --help${NC}
+
+${CYAN}EXAMPLES:${NC}
+  ai code "Create a Python Flask API with a /hello route"
+  ai git status
+  ai "My tests are failing in this project. Find the bug and fix it."
+EOF
+}
+
+main() {
+    init_db; load_config_values
+    if [[ $# -eq 0 ]]; then show_help; exit 0; fi
+
+    case "$1" in
+        --setup)
+            log_info "Setting up environment and dependencies..."
+            if command -v apt-get &>/dev/null; then sudo apt-get update && sudo apt-get install -y sqlite3 git tree;
+            elif command -v brew &>/dev/null; then brew install sqlite git tree; fi
+            # Set default models in config
+            set_config messenger_model "$DEFAULT_MESSENGER_MODEL"
+            set_config combinator_model "$DEFAULT_COMBINATOR_MODEL"
+            set_config trader_model "$DEFAULT_TRADER_MODEL"
+            set_config codewriter_model "$DEFAULT_CODEWRITER_MODEL"
+            log_success "Setup complete. Models configured." ;;
+        --help|-h) show_help ;;
+        code) shift; code_writer "$@" ;;
+        git) shift; git_operation "${1:-status}" "${2:-.}" "${3:-}" ;;
+        memory) shift; search_memory "${*:-.}" ;;
+        setup-ssh) if [[ $# -lt 2 ]]; then log_error "SSH key content required."; fi; setup_ssh_key "$2"; test_ssh ;;
+        config) 
+            log_phase "Current Configuration"
+            sqlite3 -header -column "$CONFIG_DB" "SELECT * FROM config;" 2>/dev/null || echo "No config set."
+            echo "SSH Key: $GIT_SSH_KEY ($( [[ -f "$GIT_SSH_KEY" ]] && echo "Exists" || echo "Not Found"))"
+            ;;
+        *) run_triumvirate_agent "$@" ;;
+    esac
+}
+
+# --- ENTRY POINT ---
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

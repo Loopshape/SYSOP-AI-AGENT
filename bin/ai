@@ -1,944 +1,218 @@
 #!/usr/bin/env bash
-# AI DevOps Platform v8.1 - Bulletproof Verbose Edition
-# Single-file implementation with comprehensive error handling and verbose logging
+# ai.sh - AI DevOps Platform v10.0 - The Grand Unification Edition
+# A single-file, multi-modal, multi-agent AI with a complete DevOps toolkit.
 
 set -euo pipefail
 IFS=$'\n\t'
 
 # --- CONFIGURATION ---
-SCRIPT_NAME="ai"
-SCRIPT_VERSION="8.1.0"
 AI_HOME="${AI_HOME:-$HOME/.ai_agent}"
 PROJECTS_DIR="${PROJECTS_DIR:-$HOME/ai_projects}"
-SSH_DIR="$HOME/.ssh"
-GIT_SSH_KEY="$SSH_DIR/id_ai_agent"
-LOG_FILE="$AI_HOME/ai.log"
 
-# Default Worker Models
-DEFAULT_MESSENGER_MODEL="gemma3:1b"
-DEFAULT_COMBINATOR_MODEL="deepseek-r1:1.5b"
-DEFAULT_TRADER_MODEL="2244-1"
+# --- Models (can be overridden via --config) ---
+DEFAULT_AGENT_MODEL="llama3.1:8b"
+DEFAULT_CODEWRITER_MODEL="codellama:7b"
+DEFAULT_VALIDATOR_MODEL="2244-1"
 
-# Initialize with defaults
-MESSENGER_MODEL=""
-COMBINATOR_MODEL=""
-TRADER_MODEL=""
+# Will be loaded from config
+AGENT_MODEL=""
+CODEWRITER_MODEL=""
+VALIDATOR_MODEL=""
 
 OLLAMA_BIN="$(command -v ollama || true)"
 MEMORY_DB="$AI_HOME/memory.db"
-HASH_INDEX_DB="$AI_HOME/hashes.db"
-POOL_INDEX_DB="$AI_HOME/pool_index.db"
-API_LOGS_DB="$AI_HOME/api_logs.db"
 CONFIG_DB="$AI_HOME/config.db"
+MAX_ITERATIONS=15
 
-API_PORT="${API_PORT:-8080}"
-API_PID_FILE="$AI_HOME/api.pid"
-MAX_AGENT_ITERATIONS=10
-MAX_TRIUMVIRATE_ROUNDS=5
+# --- COLORS & LOGGING ---
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'; NC='\033[0m'
+log() { printf "${BLUE}[%s]${NC} %s\n" "$(date '+%T')" "$*"; }
+log_success() { log "${GREEN}$*${NC}"; }
+log_warn() { log "${YELLOW}WARN: $*${NC}"; }
+log_error() { log "${RED}ERROR: $*${NC}"; exit 1; }
+log_info() { log "${CYAN}$*${NC}"; }
+log_phase() { echo -e "\n${PURPLE}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}"; log "${PURPLE}$*${NC}"; }
 
-# --- VERBOSE LOGGING SYSTEM ---
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'
-ORANGE='\033[0;33m'; NC='\033[0m'
-
-# Log levels: DEBUG, INFO, WARN, ERROR, SUCCESS
-LOG_LEVEL="${LOG_LEVEL:-INFO}"
-
-log_to_file() {
-    local level="$1" message="$2"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $message" >> "$LOG_FILE"
-}
-
-log_debug() { 
-    if [[ "$LOG_LEVEL" == "DEBUG" ]]; then
-        printf "${PURPLE}[DEBUG][%s]${NC} %s\\n" "$(date '+%T')" "$*" >&2
-        log_to_file "DEBUG" "$*"
-    fi
-}
-
-log_info() { 
-    if [[ "$LOG_LEVEL" =~ ^(DEBUG|INFO)$ ]]; then
-        printf "${BLUE}[INFO][%s]${NC} %s\\n" "$(date '+%T')" "$*" >&2
-        log_to_file "INFO" "$*"
-    fi
-}
-
-log_warn() { 
-    printf "${YELLOW}[WARN][%s]${NC} %s\\n" "$(date '+%T')" "$*" >&2
-    log_to_file "WARN" "$*"
-}
-
-log_error() { 
-    printf "${RED}[ERROR][%s]${NC} %s\\n" "$(date '+%T')" "$*" >&2
-    log_to_file "ERROR" "$*"
-    return 1
-}
-
-log_success() { 
-    printf "${GREEN}[SUCCESS][%s]${NC} %s\\n" "$(date '+%T')" "$*" >&2
-    log_to_file "SUCCESS" "$*"
-}
-
-log_think() { 
-    printf "${ORANGE}🤔 [THINK][%s]${NC} %s\\n" "$(date '+%T')" "$*" >&2
-    log_to_file "THINK" "$*"
-}
-
-log_analysis() { 
-    printf "${PURPLE}🔍 [ANALYSIS][%s]${NC} %s\\n" "$(date '+%T')" "$*" >&2
-    log_to_file "ANALYSIS" "$*"
-}
-
-log_plan() { 
-    printf "${CYAN}📋 [PLAN][%s]${NC} %s\\n" "$(date '+%T')" "$*" >&2
-    log_to_file "PLAN" "$*"
-}
-
-log_execute() { 
-    printf "${GREEN}⚡ [EXECUTE][%s]${NC} %s\\n" "$(date '+%T')" "$*" >&2
-    log_to_file "EXECUTE" "$*"
-}
-
-log_memory() { 
-    printf "${YELLOW}🧠 [MEMORY][%s]${NC} %s\\n" "$(date '+%T')" "$*" >&2
-    log_to_file "MEMORY" "$*"
-}
-
-log_worker_start() {
-    echo -e "\\n${PURPLE}┌────────────────────────────────────────────────────────────┐${NC}" >&2
-    echo -e "${PURPLE}│ 🧠 WORKER: $1 ($2) ${NC}" >&2
-    echo -e "${PURPLE}└────────────────────────────────────────────────────────────┘${NC}" >&2
-    echo -e "${CYAN}--- AI Thinking (Live Stream) ---${NC}" >&2
-    log_to_file "WORKER_START" "$1 ($2)"
-}
-
-log_worker_end() {
-    echo -e "${CYAN}--- End of Worker Thought ---${NC}" >&2
-    echo -e "${PURPLE}════════════════════════════════════════════════════════════${NC}\\n" >&2
-    log_to_file "WORKER_END" "Completed worker cycle"
-}
-
-# --- BULLETPROOF ERROR HANDLING ---
-trap 'cleanup_on_exit' EXIT INT TERM
-
-cleanup_on_exit() {
-    local exit_code=$?
-    log_debug "Cleanup initiated with exit code: $exit_code"
-    
-    # Stop API server if running
-    if [[ -f "$API_PID_FILE" ]]; then
-        local api_pid=$(cat "$API_PID_FILE" 2>/dev/null || echo "")
-        if [[ -n "$api_pid" ]] && kill -0 "$api_pid" 2>/dev/null; then
-            log_info "Stopping API server (PID: $api_pid) during cleanup"
-            kill "$api_pid" 2>/dev/null || true
-            rm -f "$API_PID_FILE"
-        fi
-    fi
-    
-    # Cleanup any temporary files
-    find "$AI_HOME" -name "*.tmp" -delete 2>/dev/null || true
-    
-    if [[ $exit_code -eq 0 ]]; then
-        log_success "Script completed successfully"
-    else
-        log_error "Script exited with error code: $exit_code"
-    fi
-}
-
-# Robust command execution with error handling
-safe_exec() {
-    local cmd="$1"
-    local description="${2:-Executing command}"
-    
-    log_debug "Safe exec: $description"
-    log_debug "Command: $cmd"
-    
-    if eval "$cmd"; then
-        log_debug "Command succeeded: $description"
-        return 0
-    else
-        local exit_code=$?
-        log_error "Command failed (exit $exit_code): $description"
-        log_error "Failed command: $cmd"
-        return $exit_code
-    fi
-}
-
-# --- DIRECTORY AND ENVIRONMENT SETUP ---
-setup_directories() {
-    log_debug "Setting up directories: AI_HOME=$AI_HOME, PROJECTS_DIR=$PROJECTS_DIR"
-    
-    local dirs=("$AI_HOME" "$PROJECTS_DIR" "$SSH_DIR")
-    for dir in "${dirs[@]}"; do
-        if [[ ! -d "$dir" ]]; then
-            log_info "Creating directory: $dir"
-            if ! mkdir -p "$dir"; then
-                log_error "Failed to create directory: $dir"
-                return 1
-            fi
-        fi
-        log_debug "Directory verified: $dir"
-    done
-    
-    # Secure SSH directory permissions
-    if [[ -d "$SSH_DIR" ]]; then
-        chmod 700 "$SSH_DIR" 2>/dev/null || log_warn "Could not set permissions on $SSH_DIR"
-    fi
-    
-    log_success "Directory structure verified"
-}
-
-# --- SQLITE UTILITIES WITH ERROR HANDLING ---
-sqlite_escape() { 
-    echo "$1" | sed "s/'/''/g" 
-}
-
+# --- BOOTSTRAP & DB ---
+mkdir -p "$AI_HOME" "$PROJECTS_DIR"
 init_db() {
-    log_debug "Initializing databases"
-    
-    if ! command -v sqlite3 &> /dev/null; then
-        log_error "sqlite3 is required but not installed"
-        return 1
-    fi
-    
-    local dbs=("$MEMORY_DB" "$HASH_INDEX_DB" "$CONFIG_DB" "$POOL_INDEX_DB" "$API_LOGS_DB")
-    local schemas=(
-        "CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, prompt TEXT, response TEXT, pool_hash TEXT, task_hash TEXT);"
-        "CREATE TABLE IF NOT EXISTS hashes (type TEXT, target TEXT, hash TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP);"
-        "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);"
-        "CREATE TABLE IF NOT EXISTS pools (pool_hash TEXT PRIMARY KEY, rehash_count INTEGER DEFAULT 0, tasks TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP);"
-        "CREATE TABLE IF NOT EXISTS api_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, endpoint TEXT, method TEXT, payload TEXT);"
-    )
-    
-    for i in "${!dbs[@]}"; do
-        local db="${dbs[$i]}"
-        local schema="${schemas[$i]}"
-        
-        log_debug "Initializing database: $(basename "$db")"
-        if ! sqlite3 "$db" "$schema" 2>/dev/null; then
-            log_warn "Failed to initialize database: $db"
-        fi
-    done
-    
-    log_success "Databases initialized"
+    sqlite3 "$MEMORY_DB" "CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY, timestamp DATETIME, mode TEXT, prompt TEXT, result TEXT, status TEXT, task_id TEXT);" 2>/dev/null || true
+    sqlite3 "$CONFIG_DB" "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);" 2>/dev/null || true
 }
+sqlite_escape() { echo "$1" | sed "s/'/''/g"; }
 
-# --- CONFIGURATION MANAGEMENT ---
-set_config() { 
-    local k="$1" v="$2"
-    log_debug "Setting config: $k = [REDACTED]"
-    
-    if sqlite3 "$CONFIG_DB" "INSERT OR REPLACE INTO config (key, value) VALUES ('$k', '$(sqlite_escape "$v")');" 2>/dev/null; then
-        log_success "Config set: $k"
-    else
-        log_error "Failed to set config: $k"
-        return 1
-    fi
-}
-
-get_config() { 
-    local k="$1"
-    local result
-    result=$(sqlite3 "$CONFIG_DB" "SELECT value FROM config WHERE key = '$k';" 2>/dev/null)
-    log_debug "Retrieved config: $k = $result"
-    echo "$result"
-}
-
-view_config() { 
-    log_debug "Viewing all configuration"
-    sqlite3 -header -column "$CONFIG_DB" "SELECT * FROM config;" 2>/dev/null || echo "No configuration set."
-}
-
+# --- CONFIG & MEMORY ---
+set_config() { sqlite3 "$CONFIG_DB" "INSERT OR REPLACE INTO config (key, value) VALUES ('$(sqlite_escape "$1")', '$(sqlite_escape "$2")');"; log_success "Config set: $1 = $2"; }
+get_config() { sqlite3 "$CONFIG_DB" "SELECT value FROM config WHERE key = '$(sqlite_escape "$1")';" 2>/dev/null; }
 load_config_values() {
-    log_debug "Loading configuration values"
-    
-    local messenger_config=$(get_config messenger_model)
-    local combinator_config=$(get_config combinator_model)
-    local trader_config=$(get_config trader_model)
-    
-    MESSENGER_MODEL="${messenger_config:-$DEFAULT_MESSENGER_MODEL}"
-    COMBINATOR_MODEL="${combinator_config:-$DEFAULT_COMBINATOR_MODEL}"
-    TRADER_MODEL="${trader_config:-$DEFAULT_TRADER_MODEL}"
-    
-    AI_TEMPERATURE="$(get_config temperature || echo "0.7")"
-    AI_TOP_P="$(get_config top_p || echo "0.9")"
-    AI_SEED="$(get_config seed || echo "")"
-    API_PORT="$(get_config api_port || echo "8080")"
-    
-    log_info "Loaded models: Messenger=$MESSENGER_MODEL, Combinator=$COMBINATOR_MODEL, Trader=$TRADER_MODEL"
-    log_debug "AI parameters: temperature=$AI_TEMPERATURE, top_p=$AI_TOP_P, seed=$AI_SEED"
+    AGENT_MODEL=$(get_config agent_model || echo "$DEFAULT_AGENT_MODEL")
+    CODEWRITER_MODEL=$(get_config codewriter_model || echo "$DEFAULT_CODEWRITER_MODEL")
+    VALIDATOR_MODEL=$(get_config validator_model || echo "$DEFAULT_VALIDATOR_MODEL")
+}
+add_memory() { sqlite3 "$MEMORY_DB" "INSERT INTO memories (mode,prompt,result,status,task_id) VALUES ('$1','$(sqlite_escape "$2")','$(sqlite_escape "$3")','$4','$5');" 2>/dev/null; }
+search_memory() { sqlite3 -header -column "$MEMORY_DB" "SELECT timestamp,mode,prompt,status FROM memories WHERE prompt LIKE '%$(sqlite_escape "$1")%' ORDER BY timestamp DESC LIMIT 5;" 2>/dev/null; }
+
+# --- CORE UTILITIES ---
+ensure_ollama_server() { if ! pgrep -f "ollama serve" >/dev/null; then log "Ollama starting..."; nohup "$OLLAMA_BIN" serve >/dev/null 2>&1 & sleep 3; fi; }
+confirm_action() { echo -e "\n${YELLOW}PROPOSED ACTION:${NC} ${CYAN}$1${NC}"; read -p "Approve? [y/N] " -n 1 -r c; echo; [[ "$c" =~ ^[Yy]$ ]]; }
+gen_task_id() { echo -n "$1$(date +%s%N)$RANDOM" | sha256sum | cut -c1-16; }
+
+# --- AI INTERACTION ---
+run_model_streaming() {
+    local model="$1" prompt="$2"; ensure_ollama_server
+    log_info "Querying model ${CYAN}$model${NC}... Output will stream below."; echo -e "${GREEN}--- AI Response ---${NC}"
+    local response; response=$("$OLLAMA_BIN" run "$model" "$prompt" | tee /dev/tty); echo "$response"
 }
 
-# --- MEMORY MANAGEMENT ---
-add_to_memory() { 
-    local p="$1" r="$2" ph="$3" th="$4"
-    log_debug "Adding to memory: pool_hash=$ph, task_hash=$th"
-    
-    if sqlite3 "$MEMORY_DB" "INSERT INTO memories (prompt, response, pool_hash, task_hash) VALUES ('$(sqlite_escape "$p")', '$(sqlite_escape "$r")', '$ph', '$th');" 2>/dev/null; then
-        log_debug "Memory entry added successfully"
-    else
-        log_warn "Failed to add memory entry"
-    fi
-}
+# --- AGENT TOOLS ---
+tool_read_file() { if [[ -f "$2" ]]; then cat "$2"; else echo "Error: File not found."; fi; }
+tool_list_directory() { tree -L 2 "${2:-.}"; }
+tool_web_search() { curl -sL "https://html.duckduckgo.com/html/?q=$(jq -nr --arg q "$2" '$q|@uri')" | lynx -dump -stdin -nolist; }
+tool_write_file() { local p="$2" c="$3"; if confirm_action "Write to file: $p"; then mkdir -p "$(dirname "$p")"; echo -e "$c" > "$p"; echo "Success: File written."; else echo "User aborted."; fi; }
+tool_run_command() { if confirm_action "Run command: $2"; then (eval "$2") 2>&1 || true; else echo "User aborted."; fi; }
 
-search_memory() { 
-    local q="$1" l="${2:-5}"
-    log_debug "Searching memory for: $q (limit: $l)"
+# --- UNIFIED INTERACTIVE AGENT (DEFAULT) ---
+run_unified_agent() {
+    local user_prompt="$*"
+    local task_id=$(gen_task_id "$user_prompt"); local project_dir="$PROJECTS_DIR/$task_id"
+    mkdir -p "$project_dir"; cd "$project_dir"
+    log_success "Created project workspace: $project_dir"
     
-    local result
-    result=$(sqlite3 -header -column "$MEMORY_DB" "SELECT timestamp,prompt,response FROM memories WHERE prompt LIKE '%$(sqlite_escape "$q")%' OR response LIKE '%$(sqlite_escape "$q")%' ORDER BY timestamp DESC LIMIT $l;" 2>/dev/null)
+    local memories=$(search_memory "$user_prompt")
     
-    if [[ -n "$result" ]]; then
-        log_debug "Memory search found results"
-        echo "$result"
-    else
-        log_debug "Memory search returned no results"
-        echo "No relevant memories found."
-    fi
-}
+    local system_prompt="You are a powerful AI agent with supervised access to the local filesystem and shell. Your goal is to solve the user's request by thinking step-by-step.
+TOOLS: read_file, list_directory, web_search, write_file, run_command
+RULES:
+1. [REASONING] First, explain your thought process and your plan.
+2. [TOOL] Then, propose ONE or MORE tools to use.
+3. For 'write_file', use a [CONTENT] block for multi-line content.
+4. When you have enough information, provide the final answer using [FINAL_ANSWER].
 
-clear_memory() { 
-    log_warn "Request to clear ALL memory data"
-    if confirm_action "Clear ALL memory data"; then
-        if sqlite3 "$MEMORY_DB" "DELETE FROM memories;" 2>/dev/null; then
-            log_success "Memory cleared"
-        else
-            log_error "Failed to clear memory"
+--- RELEVANT MEMORIES ---
+$memories
+---
+Begin. User Request: $user_prompt"
+    
+    local conversation_history="$system_prompt"; local final_answer=""
+    for ((i=1; i<=MAX_ITERATIONS; i++)); do
+        log_phase "Agent Iteration $i/$MAX_ITERATIONS"
+        local ai_response; ai_response=$(run_model_streaming "$AGENT_MODEL" "$conversation_history")
+
+        if [[ "$ai_response" == *"[FINAL_ANSWER]"* ]]; then
+            final_answer=$(echo "$ai_response" | sed -n '/\[FINAL_ANSWER\]/,$p' | sed '1d'); break
         fi
-    else
-        log_info "Memory clear cancelled by user"
-    fi
-}
 
-# --- HASHING FUNCTIONS ---
-hash_string() { 
-    echo -n "$1" | sha256sum | cut -d' ' -f1 
-}
+        local tool_lines; tool_lines=$(echo "$ai_response" | grep '\[TOOL\]')
+        if [[ -z "$tool_lines" ]]; then log_warn "AI did not choose a tool. Assuming final answer."; final_answer="$ai_response"; break; fi
 
-hash_file_content() { 
-    if [[ -f "$1" ]]; then
-        local hash
-        hash=$(sha256sum "$1" | cut -d' ' -f1)
-        log_debug "Hashed file: $1 -> $hash"
-        echo "$hash"
-    else
-        log_error "File not found: $1"
-        return 1
-    fi
-}
-
-hash_repo_content() { 
-    if [[ -d "$1" ]]; then
-        local hash
-        hash=$(find "$1" -type f ! -path "*/.git/*" -exec cat {} + 2>/dev/null | sha256sum | cut -d' ' -f1)
-        log_debug "Hashed repo: $1 -> $hash"
-        echo "$hash"
-    else
-        log_error "Directory not found: $1"
-        return 1
-    fi
-}
-
-record_hash() { 
-    local type="$1" target="$2" hash="$3"
-    log_debug "Recording hash: $type:$target -> $hash"
-    
-    if sqlite3 "$HASH_INDEX_DB" "INSERT OR REPLACE INTO hashes (type, target, hash) VALUES ('$type', '$(sqlite_escape "$target")', '$hash');" 2>/dev/null; then
-        log_info "Recorded hash for $type: $target"
-    else
-        log_warn "Failed to record hash for $type: $target"
-    fi
-}
-
-get_hash() { 
-    local type="$1" target="$2"
-    local result
-    result=$(sqlite3 "$HASH_INDEX_DB" "SELECT hash FROM hashes WHERE type='$type' AND target='$(sqlite_escape "$target")';" 2>/dev/null)
-    log_debug "Retrieved hash for $type:$target -> $result"
-    echo "$result"
-}
-
-view_hash_index() { 
-    log_debug "Viewing hash index"
-    sqlite3 -header -column "$HASH_INDEX_DB" "SELECT * FROM hashes ORDER BY timestamp DESC;" 2>/dev/null || echo "No hashes recorded."
-}
-
-# --- TASK POOLING SYSTEM ---
-setup_task_pool() {
-    local prompt="$1"
-    log_debug "Setting up task pool for prompt: ${prompt:0:50}..."
-    
-    log_think "Analyzing prompt for semantic hashing..."
-    
-    # Enhanced semantic hashing
-    local semantic_hash_val
-    semantic_hash_val=$(echo "$prompt" | tr ' ' '-' | tr -cd 'a-zA-Z0-9-' | cut -c1-16)
-    if [[ -z "$semantic_hash_val" ]]; then
-        semantic_hash_val=$(hash_string "$prompt" | cut -c1-16)
-        log_warn "Fallback: Generated semantic hash from raw prompt"
-    fi
-
-    local instance_hash_val=$(hash_string "$prompt$(date +%s%N)" | cut -c1-16)
-    local pool_dir="$PROJECTS_DIR/$semantic_hash_val"
-    
-    log_debug "Creating pool directory: $pool_dir"
-    if ! mkdir -p "$pool_dir"; then
-        log_error "Failed to create pool directory: $pool_dir"
-        return 1
-    fi
-
-    local rehash_count=0
-    local tasks_json='[]'
-    local existing_data
-    
-    existing_data=$(sqlite3 "$POOL_INDEX_DB" "SELECT rehash_count, tasks FROM pools WHERE pool_hash = '$semantic_hash_val';" 2>/dev/null)
-    
-    if [[ -n "$existing_data" ]]; then
-        rehash_count=$(echo "$existing_data" | cut -d'|' -f1)
-        local existing_tasks=$(echo "$existing_data" | cut -d'|' -f2)
-        rehash_count=$((rehash_count + 1))
-        
-        if command -v jq &> /dev/null && [[ -n "$existing_tasks" ]]; then
-            tasks_json=$(echo "$existing_tasks" | jq -c --arg task "$instance_hash_val" '. + [$task]' 2>/dev/null || echo "[\"$instance_hash_val\"]")
-        else
-            tasks_json="[\"$instance_hash_val\"]"
-        fi
-        
-        if ! sqlite3 "$POOL_INDEX_DB" "UPDATE pools SET rehash_count = $rehash_count, tasks = '$(sqlite_escape "$tasks_json")' WHERE pool_hash = '$semantic_hash_val';" 2>/dev/null; then
-            log_warn "Failed to update pool index"
-        fi
-    else
-        rehash_count=1
-        tasks_json="[\"$instance_hash_val\"]"
-        if ! sqlite3 "$POOL_INDEX_DB" "INSERT INTO pools (pool_hash, rehash_count, tasks) VALUES ('$semantic_hash_val', $rehash_count, '$(sqlite_escape "$tasks_json")');" 2>/dev/null; then
-            log_warn "Failed to insert new pool index"
-        fi
-    fi
-
-    log_memory "Task pool created: semantic=$semantic_hash_val, instance=$instance_hash_val, resonance=$rehash_count"
-    echo "$semantic_hash_val $instance_hash_val $rehash_count"
-}
-
-# --- USER CONFIRMATION ---
-confirm_action() {
-    local action="$1"
-    local response
-    
-    echo -e "${YELLOW}CONFIRM: $action${NC}" >&2
-    read -p "Type 'yes' to confirm: " -r response
-    
-    if [[ "$response" == "yes" ]]; then
-        log_debug "User confirmed action: $action"
-        return 0
-    else
-        log_warn "User cancelled action: $action"
-        return 1
-    fi
-}
-
-# --- BULLETPROOF TOOL IMPLEMENTATIONS ---
-tool_read_file() {
-    local p="$1"
-    log_think "Reading file: $p"
-    
-    if [[ ! -f "$p" ]]; then
-        log_error "File not found: $p"
-        echo "ERROR: File not found: $p"
-        return 1
-    fi
-    
-    if [[ ! -r "$p" ]]; then
-        log_error "No read permission for file: $p"
-        echo "ERROR: No read permission for file: $p"
-        return 1
-    fi
-    
-    log_debug "Successfully reading file: $p"
-    cat "$p"
-}
-
-tool_list_directory() {
-    local p="${1:-.}"
-    log_think "Listing directory: $p"
-    
-    if [[ ! -d "$p" ]]; then
-        log_error "Directory not found: $p"
-        echo "ERROR: Directory not found: $p"
-        return 1
-    fi
-    
-    if [[ ! -r "$p" ]]; then
-        log_error "No read permission for directory: $p"
-        echo "ERROR: No read permission for directory: $p"
-        return 1
-    fi
-    
-    log_debug "Successfully listing directory: $p"
-    if command -v tree &> /dev/null; then
-        tree -L 2 "$p"
-    else
-        ls -la "$p"
-    fi
-}
-
-tool_web_search() {
-    if ! command -v googler &> /dev/null; then 
-        log_error "googler not installed"
-        echo "ERROR: googler not installed. Install with: sudo apt-get install googler"
-        return 1
-    fi
-    
-    local query="$1" count="${2:-3}"
-    log_think "Searching web for: $query"
-    
-    if confirm_action "Search web for: $query"; then
-        log_debug "Executing web search: $query (count: $count)"
-        googler --count "$count" --exact "$query"
-    else
-        log_info "Web search cancelled by user"
-        echo "ACTION CANCELED: Web search."
-    fi
-}
-
-tool_write_file() {
-    local path="$1" content="$2"
-    log_think "Writing to file: $path"
-    
-    if confirm_action "Write to file: $path"; then
-        local dir=$(dirname "$path")
-        log_debug "Creating directory: $dir"
-        
-        if ! mkdir -p "$dir"; then
-            log_error "Failed to create directory: $dir"
-            echo "ERROR: Failed to create directory: $dir"
-            return 1
-        fi
-        
-        if echo "$content" > "$path"; then
-            log_success "File written: $path"
-            echo "SUCCESS: File written to $path"
-        else
-            log_error "Failed to write file: $path"
-            echo "ERROR: Failed to write file: $path"
-            return 1
-        fi
-    else
-        log_info "File write cancelled by user"
-        echo "ACTION CANCELED: Write to $path"
-    fi
-}
-
-tool_run_command() {
-    local cmd="$1"
-    local project_root
-    project_root=$(get_config current_project_root || echo ".")
-    
-    log_think "Running command: $cmd (in: $project_root)"
-    
-    if confirm_action "Run command: $cmd (in: $project_root)"; then
-        log_debug "Executing command: $cmd in $project_root"
-        
-        if (cd "$project_root" && eval "$cmd" 2>&1); then
-            log_success "Command executed successfully"
-        else
-            local exit_code=$?
-            log_error "Command failed with exit code: $exit_code"
-            return $exit_code
-        fi
-    else
-        log_info "Command execution cancelled by user"
-        echo "ACTION CANCELED: Run command."
-    fi
-}
-
-# Additional tools would follow the same pattern...
-
-# --- AI WORKER FUNCTIONS WITH ENHANCED ERROR HANDLING ---
-run_worker_raw() {
-    local worker_name="$1" model_to_use="$2" system_prompt="$3" user_prompt="$4"
-    
-    log_debug "Starting raw worker: $worker_name with model: $model_to_use"
-    
-    if [[ -z "$model_to_use" ]]; then
-        log_error "Model parameter is empty for worker: $worker_name"
-        return 1
-    fi
-    
-    local temperature="${AI_TEMPERATURE:-0.7}"
-    local top_p="${AI_TOP_P:-0.9}"
-    local seed="${AI_SEED:-}"
-    
-    log_debug "AI parameters: temperature=$temperature, top_p=$top_p, seed=$seed"
-    
-    # Validate Ollama connection
-    if ! curl -s http://localhost:11434/api/tags > /dev/null; then
-        log_error "Ollama service not responding on localhost:11434"
-        return 1
-    fi
-    
-    local json_payload
-    if ! json_payload=$(jq -n \
-        --arg model "$model_to_use" \
-        --arg system "$system_prompt" \
-        --arg prompt "$user_prompt" \
-        --argjson temp "$temperature" \
-        --argjson top_p "$top_p" \
-        '{ "model": $model, "prompt": $prompt, "system": $system, "options": { "temperature": $temp, "top_p": $top_p }, "stream": true }' 2>/dev/null); then
-        log_error "Failed to create JSON payload for Ollama"
-        return 1
-    fi
-    
-    if [[ -n "$seed" ]]; then
-        json_payload=$(echo "$json_payload" | jq --argjson seed "$seed" '.options.seed = $seed' 2>/dev/null)
-    fi
-    
-    local response_buffer=""
-    log_info "Sending request to Ollama with model: $model_to_use"
-    
-    local curl_output
-    if ! curl_output=$(curl -s -X POST http://localhost:11434/api/generate \
-        -H "Content-Type: application/json" \
-        -d "$json_payload" 2>&1); then
-        log_error "Curl request failed for Ollama API"
-        return 1
-    fi
-    
-    # Process streaming response
-    while IFS= read -r line; do
-        if [[ -n "$line" ]]; then
-            local extracted_response=$(echo "$line" | jq -r '.response? // empty' 2>/dev/null)
-            if [[ -n "$extracted_response" ]]; then
-                printf "%s" "$extracted_response"
-                response_buffer+="$extracted_response"
-            fi
-        fi
-    done <<< "$curl_output"
-    
-    echo -e "\\n${NC}"
-    echo "$response_buffer"
-}
-
-# --- TRIUMVIRATE AGENT ORCHESTRATION ---
-run_triumvirate_agent() {
-    local user_prompt="$1"
-    
-    log_debug "Starting triumvirate agent with prompt: ${user_prompt:0:100}..."
-    
-    # Setup task pool
-    local pool_info
-    if ! pool_info=$(setup_task_pool "$user_prompt"); then
-        log_error "Failed to setup task pool"
-        return 1
-    fi
-    
-    local semantic_hash=$(echo "$pool_info" | awk '{print $1}')
-    local instance_hash=$(echo "$pool_info" | awk '{print $2}')
-    local rehash_count=$(echo "$pool_info" | awk '{print $3}')
-    
-    local project_dir="$PROJECTS_DIR/$semantic_hash/$instance_hash"
-    local task_event_file="$project_dir/events.jsonl"
-    
-    log_debug "Creating project directory: $project_dir"
-    if ! mkdir -p "$project_dir"; then
-        log_error "Failed to create project directory: $project_dir"
-        return 1
-    fi
-    
-    set_config "current_project_root" "$project_dir"
-    
-    echo -e "\\n${GREEN}🚀 STARTING TRIUMVIRATE MIND PROCESSING FOR: ${CYAN}$user_prompt${NC}" >&2
-    log_info "Project directory: $project_dir"
-    log_info "Semantic hash: $semantic_hash"
-    log_info "Instance hash: $instance_hash"
-    log_info "Resonance count: $rehash_count"
-    
-    # Search for relevant memories
-    log_think "Searching memory for relevant context..."
-    local context_memories
-    context_memories=$(search_memory "$user_prompt" 3)
-    
-    local final_trader_response=""
-    
-    for ((tri_round=1; tri_round<=MAX_TRIUMVIRATE_ROUNDS; tri_round++)); do
-        echo -e "\\n${CYAN}---------- TRIUMVIRATE ROUND $tri_round/$MAX_TRIUMVIRATE_ROUNDS ----------${NC}" >&2
-        log_info "Starting triumvirate round $tri_round"
-        
-        # Phase 1: Messenger
-        log_analysis "Messenger Phase: Analyzing user request and gathering initial data..."
-        local messenger_system_prompt="You are the MESSENGER. Your role is to analyze the user's request, break it down into core components, and use tools to gather initial data."
-        local messenger_response
-        messenger_response=$(run_worker_interactive "Messenger" "$MESSENGER_MODEL" "$messenger_system_prompt" "$user_prompt" "$context_memories" "$rehash_count" "$task_event_file")
-        
-        if echo "$messenger_response" | grep -q 'FINAL:'; then
-            log_warn "Messenger provided FINAL response, skipping Combinator/Trader"
-            final_trader_response="Messenger's Final Findings: $(echo "$messenger_response" | grep 'FINAL:' | sed 's/FINAL: //')"
-            break
-        fi
-        
-        # Phase 2: Combinator
-        log_plan "Combinator Phase: Creating execution plan..."
-        local combinator_system_prompt="You are the COMBINATOR. Based on the user's request and the Messenger's report, create a detailed execution plan."
-        local combinator_user_prompt="User Request: ${user_prompt}\\nMessenger's Report:\\n${messenger_response}"
-        local combinator_response
-        combinator_response=$(run_worker_interactive "Combinator" "$COMBINATOR_MODEL" "$combinator_system_prompt" "$combinator_user_prompt" "$context_memories" "$rehash_count" "$task_event_file")
-        
-        if echo "$combinator_response" | grep -q 'FINAL:'; then
-            log_warn "Combinator provided FINAL response, skipping Trader"
-            final_trader_response="Combinator's Final Plan: $(echo "$combinator_response" | grep 'FINAL:' | sed 's/FINAL: //')"
-            break
-        fi
-        
-        # Phase 3: Trader
-        log_execute "Trader Phase: Executing plan and making decisions..."
-        local trader_system_prompt="You are the TRADER. Execute the necessary actions and provide a [FINAL_ANSWER] when complete."
-        local trader_user_prompt="Original Request: ${user_prompt}\\nMessenger's Report:\\n${messenger_response}\\nCombinator's Plan:\\n${combinator_response}"
-        local trader_response
-        trader_response=$(run_worker_interactive "Trader" "$TRADER_MODEL" "$trader_system_prompt" "$trader_user_prompt" "$context_memories" "$rehash_count" "$task_event_file")
-        
-        if echo "$trader_response" | grep -q '^\\[FINAL_ANSWER\\]'; then
-            final_trader_response="$trader_response"
-            break
-        else
-            log_warn "Trader did not provide FINAL_ANSWER, continuing to next round"
-        fi
+        local all_results=""
+        while IFS= read -r line; do
+            local clean_line="${line#\[TOOL\] }"; local name=$(echo "$clean_line"|awk '{print $1}'); local args=$(echo "$clean_line"|cut -d' ' -f2-); local result=""
+            if [[ "$name" == "write_file" ]]; then local content=$(echo "$ai_response"|awk '/\[CONTENT\]/{f=1;next}/\[\/CONTENT\]/{f=0} f'); result=$(tool_write_file "$args" "$content");
+            else case "$name" in read_file|list_directory|web_search|run_command) result=$(tool_"$name" "placeholder" "$args");; *) result="Error: Unknown tool '$name'.";; esac; fi
+            all_results+="\n--- Result for '$name $args' ---\n$result"
+        done <<< "$tool_lines"
+        echo -e "${CYAN}--- ALL TOOL RESULTS ---${NC}$all_results\n"
+        conversation_history+="\n$ai_response\n[TOOL_RESULT]\n$all_results"
     done
     
-    if [[ -z "$final_trader_response" ]]; then
-        final_trader_response="ERROR: Maximum Triumvirate rounds ($MAX_TRIUMVIRATE_ROUNDS) reached without a [FINAL_ANSWER]."
-        log_error "Max Triumvirate rounds reached without final answer"
-    fi
-    
-    # Store final interaction in memory
-    log_memory "Storing final result in memory..."
-    add_to_memory "$user_prompt" "$final_trader_response" "$semantic_hash" "$instance_hash"
-    
-    echo -e "\\n${GREEN}✅ === TRIUMVIRATE PROCESS COMPLETE ===${NC}" >&2
-    echo -e "${GREEN}📝 Final Response:${NC}" >&2
-    echo "$final_trader_response" | sed -n '/^\\[FINAL_ANSWER\\]/,$p' | sed '1d'
-    
-    # Save full response to task directory
-    echo "User Prompt: $user_prompt" > "$project_dir/summary.txt"
-    echo -e "\\n--- Final Agent Response ---\\n" >> "$project_dir/summary.txt"
-    echo "$final_trader_response" >> "$project_dir/summary.txt"
-    log_success "Full task log and summary saved in: $project_dir"
+    log_success "AGENT FINISHED"; echo -e "${GREEN}--- FINAL ANSWER ---${NC}\n$final_answer"
+    add_memory "agent" "$user_prompt" "$final_answer" "SUCCESS" "$task_id"
 }
 
-# --- DEPENDENCY CHECK & SETUP ---
-check_dependencies() {
-    log_debug "Checking dependencies"
-    
-    local missing=()
-    local critical_commands=("sqlite3" "jq" "curl" "git" "nc")
-    local optional_commands=("googler" "lynx" "tree" "wget")
-    
-    for cmd in "${critical_commands[@]}"; do
-        if ! command -v "$cmd" &> /dev/null; then
-            missing+=("$cmd")
-        fi
-    done
-    
-    if ! command -v "$OLLAMA_BIN" &> /dev/null; then
-        log_error "Ollama not found. Install from https://ollama.ai"
-        missing+=("ollama")
-    else
-        log_debug "Ollama found at: $OLLAMA_BIN"
-    fi
-    
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        log_error "Missing critical dependencies: ${missing[*]}"
-        return 1
-    fi
-    
-    for cmd in "${optional_commands[@]}"; do
-        if ! command -v "$cmd" &> /dev/null; then
-            log_warn "Optional dependency not found: $cmd"
-        fi
-    done
-    
-    log_success "Core dependencies satisfied"
-    return 0
+
+# --- OTHER MODES & DIRECT COMMANDS ---
+# Placeholders for other modes like --mode=superposition, --mode=entropic, etc.
+# Each would have its own `run_*_agent` function.
+code_writer() { # Direct, non-agent code generation
+    local prompt="$*"; local project_dir="$PWD"; log_phase "CodeWriter Mode"
+    local lang=$(run_model_streaming "$AGENT_MODEL" "Detect programming language from prompt. Output ONLY name. Prompt: $prompt")
+    local system_prompt="You are an expert code generator. Write clean, working $lang code. Output ONLY the code. User Request: $prompt"
+    local response=$(run_model_streaming "$CODEWRITER_MODEL" "$system_prompt")
+    read -p "Save to file? (Enter filename or Enter to skip): " filename
+    [[ -n "$filename" ]] && { echo "$response" > "$filename"; log_success "Saved to $filename"; }
 }
 
-setup_environment() {
-    log_info "Setting up AI Agent environment..."
-    
-    if ! setup_directories; then
-        log_error "Failed to setup directories"
-        return 1
+run_auto_fix() { # Direct, non-agent fix
+    local file_path="$1" problem="$2"; log_phase "Auto-Fix Mode for $file_path"
+    local code=$(cat "$file_path"); local lang=$(detect_language "$file_path")
+    local system_prompt="You are an expert debugger. Analyze the provided code and problem description. Your output must be ONLY the complete, corrected code.
+Language: $lang
+Problem: $problem
+--- CODE WITH BUG ---
+$code
+--- FIXED SCRIPT ---"
+    local fixed_code=$(run_model_streaming "$CODEWRITER_MODEL" "$system_prompt")
+    if confirm_action "Apply the following fix to $file_path?"; then
+        echo -e "${GREEN}--- PROPOSED FIX ---${NC}"; diff --color=always -u <(echo "$code") <(echo "$fixed_code") || true
+        echo "$fixed_code" > "$file_path"; log_success "File fixed."
     fi
-    
-    if ! init_db; then
-        log_error "Failed to initialize databases"
-        return 1
-    fi
-    
-    # Set default config values if not present
-    local default_configs=(
-        "messenger_model:$DEFAULT_MESSENGER_MODEL"
-        "combinator_model:$DEFAULT_COMBINATOR_MODEL" 
-        "trader_model:$DEFAULT_TRADER_MODEL"
-        "temperature:0.7"
-        "top_p:0.9"
-        "api_port:$API_PORT"
-    )
-    
-    for config in "${default_configs[@]}"; do
-        local key="${config%:*}"
-        local value="${config#*:}"
-        if [[ -z "$(get_config "$key")" ]]; then
-            set_config "$key" "$value"
-        fi
-    done
-    
-    load_config_values
-    log_success "Environment setup complete"
 }
 
-# --- MAIN CLI DISPATCHER ---
+# ... other direct commands like run_environmental_prompt, run_recursive_assembler etc. would go here ...
+
+# --- HELP & MAIN DISPATCHER ---
+show_help() {
+    printf "${GREEN}AI DevOps Platform v10.0 - The Grand Unification Edition${NC}\n\n"
+    printf "A single, multi-modal, multi-agent AI with a complete DevOps toolkit.\n\n"
+    printf "${CYAN}AGENT MODES:${NC}\n"
+    printf "  ${GREEN}ai --mode=agent${NC} \"prompt\"   (Default) The interactive, multi-step Unified Agent.\n"
+    printf "  ${GREEN}ai --mode=superposition${NC} ...  (Placeholder) The Quantum Superposition code generator.\n"
+    printf "  ${GREEN}ai --mode=entropic${NC} ...      (Placeholder) The Entropic, value-verifying agent.\n"
+    printf "  ${GREEN}ai --mode=mindmap${NC} ...       (Placeholder) The Cognitive Manifold agent.\n\n"
+    printf "${CYAN}DIRECT COMMANDS:${NC}\n"
+    printf "  ${GREEN}ai code${NC} \"prompt\"             Directly generates code.\n"
+    printf "  ${GREEN}ai --fix${NC} <file> \"problem\"     Analyzes and proposes a fix for a file.\n"
+    printf "  ${GREEN}ai git${NC} <op>                   Acts as a Git assistant.\n\n"
+    printf "${CYAN}UTILITY:${NC}\n"
+    printf "  ${GREEN}ai --setup, --config, --memory, --help${NC}\n\n"
+    printf "${CYAN}EXAMPLE:${NC}\n"
+    printf "  ${CYAN}ai \"Create a new nodejs project here, install express, and write a hello world server in index.js\"${NC}\n"
+}
+
 main() {
-    local start_time=$(date +%s)
-    log_debug "Script started: $SCRIPT_NAME v$SCRIPT_VERSION"
+    init_db; load_config_values
+    if [[ $# -eq 0 ]]; then show_help; exit 0; fi
+
+    local agent_mode="agent" # Default mode
+    local prompt_args=()
     
-    # Initialize environment
-    if ! setup_directories; then
-        log_error "Failed to setup directories"
-        return 1
-    fi
-    
-    init_db
-    load_config_values
-    
+    # Pre-parse arguments to find mode and separate from prompt
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --mode=*) agent_mode="${1#*=}"; shift ;;
+            *) prompt_args+=("$1"); shift ;;
+        esac
+    done
+    # Restore positional parameters for the main dispatcher
+    set -- "${prompt_args[@]}"
+
     case "${1:-}" in
-        "--setup")
-            log_info "Running setup procedure"
-            check_dependencies
-            setup_environment
-            ;;
-            
-        "--config")
-            case "${2:-}" in
-                "set") 
-                    if [[ -z "${3:-}" || -z "${4:-}" ]]; then
-                        log_error "Usage: $0 --config set <key> <value>"
-                        return 1
-                    fi
-                    set_config "$3" "$4" 
-                    ;;
-                "get") 
-                    if [[ -z "${3:-}" ]]; then
-                        log_error "Usage: $0 --config get <key>"
-                        return 1
-                    fi
-                    get_config "$3" 
-                    ;;
-                "view") view_config ;;
-                *) log_error "Usage: $0 --config [set|get|view] [key] [value]" ;;
-            esac
-            ;;
-            
-        "--hash")
-            case "${2:-}" in
-                "file") 
-                    if [[ -z "${3:-}" ]]; then
-                        log_error "Usage: $0 --hash file <path>"
-                        return 1
-                    fi
-                    local file_hash=$(hash_file_content "$3")
-                    record_hash "file" "$3" "$file_hash" 
-                    ;;
-                "prompt") 
-                    if [[ -z "${3:-}" ]]; then
-                        log_error "Usage: $0 --hash prompt \"<text>\""
-                        return 1
-                    fi
-                    local prompt_hash=$(hash_string "$3")
-                    record_hash "prompt" "$3" "$prompt_hash" 
-                    ;;
-                # Additional hash subcommands...
-                *) log_error "Usage: $0 --hash [file|prompt|repo|get|view] [target]" ;;
-            esac
-            ;;
-            
-        "--api")
-            # API management commands...
-            ;;
-            
-        "--verbose")
-            LOG_LEVEL="DEBUG"
-            log_debug "Verbose mode enabled"
-            shift
-            main "$@"
-            ;;
-            
-        "--help"|"-h"|"")
-            show_help
-            ;;
-            
+        --setup)
+            log_info "Setting up environment..."
+            if command -v apt-get &>/dev/null; then sudo apt-get update && sudo apt-get install -y sqlite3 git tree jq curl lynx; fi
+            set_config agent_model "$DEFAULT_AGENT_MODEL"
+            set_config codewriter_model "$DEFAULT_CODEWRITER_MODEL"
+            set_config validator_model "$DEFAULT_VALIDATOR_MODEL"
+            log_success "Setup complete." ;;
+        --help|-h) show_help ;;
+        code) shift; code_writer "$@" ;;
+        --fix) if [[ $# -lt 3 ]]; then log_error "Usage: ai --fix <file> \"<problem>\""; fi; run_auto_fix "$2" "$3" ;;
+        git) shift; git_operation "${1:-status}" "${2:-.}" ;;
+        --config) shift; case "${1:-}" in set) set_config "$2" "$3";; get) get_config "$2";; view) view_config;; *) log_error "Usage";; esac ;;
+        --memory) shift; case "${1:-}" in search) search_memory "$2";; clear) confirm_action "Clear ALL memory?" && sqlite3 "$MEMORY_DB" "DELETE FROM memories;";; *) log_error "Usage";; esac ;;
         *)
-            local prompt_to_run="$*"
-            if [[ -z "$prompt_to_run" ]]; then
-                log_error "No prompt provided"
-                show_help
-                return 1
-            fi
-            
-            if ! check_dependencies; then
-                log_error "Dependency check failed"
-                return 1
-            fi
-            
-            run_triumvirate_agent "$prompt_to_run"
+            log_phase "Activating Agent in Mode: $agent_mode"
+            case "$agent_mode" in
+                agent) run_unified_agent "$@" ;;
+                superposition|entropic|mindmap) log_warn "Mode '$agent_mode' is a conceptual placeholder in this unified script."; run_unified_agent "$@" ;;
+                *) log_error "Unknown agent mode: '$agent_mode'. Available modes: agent, superposition, entropic, mindmap." ;;
+            esac
             ;;
     esac
-    
-    local end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-    log_debug "Script completed in ${duration}s"
 }
 
-show_help() {
-    cat << EOF
-${GREEN}$SCRIPT_NAME v$SCRIPT_VERSION - Bulletproof Verbose Edition${NC}
-
-${CYAN}Description:${NC} Advanced AI agent system with triumvirate architecture, memory persistence, and extensive tooling.
-
-${CYAN}Usage:${NC}
-  $0 [OPTIONS] "<your prompt>"      - Run Triumvirate Agent
-  $0 --verbose "<prompt>"           - Enable verbose debugging
-  $0 --setup                        - Initial setup and dependency check
-  $0 --config [set|get|view]        - Configuration management
-  $0 --hash [file|prompt|repo]      - Content hashing utilities
-  $0 --api [start|stop|status]      - API server management
-  $0 --help                         - Show this help
-
-${CYAN}Examples:${NC}
-  $0 "Analyze current directory and suggest improvements"
-  $0 --verbose "Debug why my script is failing"
-  $0 --config set trader_model llama3.1:8b
-  $0 --hash file ./project.txt
-
-${CYAN}Log File:${NC} $LOG_FILE
-${CYAN}Data Directory:${NC} $AI_HOME
-EOF
-}
-
-# --- ENTRY POINT WITH COMPREHENSIVE ERROR HANDLING ---
+# --- ENTRY POINT ---
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    # Ensure we're in a proper environment
-    if [[ -z "$HOME" ]]; then
-        echo "ERROR: HOME environment variable not set" >&2
-        exit 1
-    fi
-    
-    # Create bin directory if it doesn't exist
-    if [[ ! -d "$(dirname "$0")" ]]; then
-        mkdir -p "$(dirname "$0")"
-    fi
-    
-    # Run main function with error trapping
-    if main "$@"; then
-        exit 0
-    else
-        exit 1
-    fi
+    main "$@"
 fi

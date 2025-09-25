@@ -1,0 +1,362 @@
+#!/bin/bash
+# ai - Universal CodeWriter & Git Assistant
+# Version 2.0 - Optimized for Bash
+
+set -euo pipefail
+
+# --- CONFIGURATION ---
+AI_HOME="${AI_HOME:-$HOME/.ai_agent}"
+PROJECTS_DIR="${PROJECTS_DIR:-$HOME/ai_projects}"
+SSH_DIR="$HOME/.ssh"
+GIT_SSH_KEY="$SSH_DIR/id_ai_agent"
+MODEL="${AI_MODEL:-codellama:7b}"
+
+# --- COLOR OUTPUT ---
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'; NC='\033[0m'
+
+log() { echo -e "${BLUE}[$(date '+%T')]${NC} $*"; }
+log_success() { log "${GREEN}$*${NC}"; }
+log_warn() { log "${YELLOW}$*${NC}"; }
+log_error() { echo -e "${RED}ERROR: $*${NC}" >&2; exit 1; }
+log_info() { log "${CYAN}$*${NC}"; }
+log_phase() { echo -e "\n${PURPLE}════════════════════════════════════════════════════════════════════════════════${NC}"; log "${PURPLE}$*${NC}"; echo -e "${PURPLE}════════════════════════════════════════════════════════════════════════════════${NC}"; }
+
+# --- INITIALIZATION ---
+init_dirs() {
+    mkdir -p "$AI_HOME" "$PROJECTS_DIR" "$SSH_DIR"
+    chmod 700 "$SSH_DIR"
+}
+
+init_db() {
+    sqlite3 "$AI_HOME/memory.db" "CREATE TABLE IF NOT EXISTS memories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        prompt TEXT,
+        response TEXT,
+        project TEXT,
+        language TEXT
+    );" 2>/dev/null || true
+}
+
+# --- MEMORY SYSTEM ---
+add_memory() {
+    local prompt="$1" response="$2" project="${3:-}" language="${4:-}"
+    sqlite3 "$AI_HOME/memory.db" "INSERT INTO memories (prompt, response, project, language) 
+    VALUES ('${prompt//\'/\"}','${response//\'/\"}','$project','$language');" 2>/dev/null
+}
+
+search_memory() {
+    local query="$1"
+    sqlite3 -header -column "$AI_HOME/memory.db" \
+        "SELECT prompt, response FROM memories 
+         WHERE prompt LIKE '%$query%' OR response LIKE '%$query%' 
+         ORDER BY timestamp DESC LIMIT 3;" 2>/dev/null || echo "No memories found."
+}
+
+# --- GIT & SSH SETUP ---
+setup_ssh_key() {
+    local key_content="$1"
+    echo "$key_content" > "$GIT_SSH_KEY"
+    chmod 600 "$GIT_SSH_KEY"
+    
+    # Configure SSH for Git hosts
+    cat > "$SSH_DIR/config" << EOF
+Host github.com
+    HostName github.com
+    User git
+    IdentityFile $GIT_SSH_KEY
+    IdentitiesOnly yes
+
+Host gitlab.com
+    HostName gitlab.com
+    User git
+    IdentityFile $GIT_SSH_KEY
+    IdentitiesOnly yes
+
+Host bitbucket.org
+    HostName bitbucket.org
+    User git
+    IdentityFile $GIT_SSH_KEY
+    IdentitiesOnly yes
+EOF
+    chmod 600 "$SSH_DIR/config"
+    log_success "SSH key configured at $GIT_SSH_KEY"
+}
+
+test_ssh() {
+    ssh -T -o ConnectTimeout=5 -o StrictHostKeyChecking=no git@github.com 2>&1 | grep -q "successfully authenticated" && 
+    log_success "SSH authentication working" || log_warn "SSH test inconclusive"
+}
+
+# --- AI CODE GENERATION ---
+detect_language() {
+    local context="$1"
+    case "$context" in
+        *python*|*py*|*import*|*def*) echo "python" ;;
+        *bash*|*shell*|*sh*|*#!/bin*) echo "bash" ;;
+        *javascript*|*js*|*node*|*console*) echo "javascript" ;;
+        *html*|*<html*|*<div*) echo "html" ;;
+        *css*|*style*|*{*}*) echo "css" ;;
+        *docker*|*Dockerfile*) echo "docker" ;;
+        *sql*|*SELECT*|*CREATE*) echo "sql" ;;
+        *json*|*{*}*) echo "json" ;;
+        *yaml*|*yml*|*---*) echo "yaml" ;;
+        *) echo "text" ;;
+    esac
+}
+
+get_project_context() {
+    local dir="${1:-.}"
+    if [[ -d "$dir/.git" ]]; then
+        echo "Git repository: $(basename "$dir")"
+        echo "Branch: $(git -C "$dir" branch --show-current 2>/dev/null || echo 'detached')"
+        echo "Remote: $(git -C "$dir" remote get-url origin 2>/dev/null || echo 'none')"
+    fi
+    
+    if [[ -f "$dir/package.json" ]]; then
+        echo "Node.js project"
+    elif [[ -f "$dir/requirements.txt" ]]; then
+        echo "Python project"
+    elif [[ -f "$dir/Cargo.toml" ]]; then
+        echo "Rust project"
+    elif [[ -f "$dir/go.mod" ]]; then
+        echo "Go project"
+    fi
+    
+    # Show recent files
+    find "$dir" -type f -name "*.py" -o -name "*.js" -o -name "*.rs" -o -name "*.go" -o -name "*.sh" | head -5 | while read f; do
+        echo "File: $(basename "$f")"
+    done
+}
+
+generate_code() {
+    local prompt="$1" project_context="$2" language="$3"
+    local system_prompt="You are an expert code generator. Write clean, efficient, working code.
+    
+Project Context:
+$project_context
+
+Language: $language
+
+Requirements:
+- Output ONLY the code, no explanations
+- Include necessary imports/dependencies
+- Add comments for complex logic
+- Ensure code is production-ready
+- If unsure, write a complete implementation
+
+User Request: $prompt"
+
+    if ! command -v ollama &>/dev/null; then
+        log_error "Ollama not installed. Install from https://ollama.ai"
+    fi
+
+    if ! pgrep -f "ollama serve" >/dev/null; then
+        log "Starting Ollama server..."
+        nohup ollama serve >/dev/null 2>&1 &
+        sleep 3
+    fi
+
+    # Check if model exists
+    if ! ollama list | grep -q "$MODEL"; then
+        log "Downloading model $MODEL..."
+        ollama pull "$MODEL"
+    fi
+
+    log_phase "Generating $language code..."
+    ollama run "$MODEL" "$system_prompt" --temperature 0.3 --top-p 0.9
+}
+
+# --- GIT OPERATIONS ---
+git_operation() {
+    local op="$1" repo_path="${2:-.}" branch="${3:-}"
+    
+    if [[ ! -d "$repo_path/.git" ]]; then
+        log_error "Not a git repository: $repo_path"
+    fi
+
+    cd "$repo_path"
+    log_phase "Git $op: $(basename "$PWD")"
+    
+    case "$op" in
+        status)
+            git status
+            echo -e "\nRecent commits:"
+            git log --oneline -5
+            ;;
+            
+        pull)
+            local current_branch=$(git branch --show-current)
+            local target_branch="${branch:-$current_branch}"
+            log_info "Pulling $target_branch from origin"
+            GIT_SSH_COMMAND="ssh -i $GIT_SSH_KEY" git pull origin "$target_branch"
+            ;;
+            
+        push)
+            if git diff --quiet && git diff --cached --quiet; then
+                log_warn "No changes to push"
+                return 0
+            fi
+            
+            echo "Changes to be pushed:"
+            git status --short
+            echo
+            read -p "Commit message: " commit_msg
+            [[ -z "$commit_msg" ]] && commit_msg="Update $(date '+%Y-%m-%d %H:%M')"
+            
+            git add .
+            git commit -m "$commit_msg"
+            GIT_SSH_COMMAND="ssh -i $GIT_SSH_KEY" git push origin "$(git branch --show-current)"
+            ;;
+            
+        sync)
+            git_operation "pull" "$repo_path" "$branch"
+            git_operation "push" "$repo_path" "$branch"
+            ;;
+            
+        clone)
+            if [[ -z "${branch:-}" ]]; then
+                GIT_SSH_COMMAND="ssh -i $GIT_SSH_KEY" git clone "$repo_path" .
+            else
+                GIT_SSH_COMMAND="ssh -i $GIT_SSH_KEY" git clone -b "$branch" "$repo_path" .
+            fi
+            ;;
+            
+        *)
+            log_error "Unknown git operation: $op"
+            ;;
+    esac
+}
+
+# --- MAIN WORKFLOW ---
+code_writer() {
+    local prompt="$*"
+    local project_dir="${PWD}"
+    local project_name=$(basename "$project_dir")
+    
+    log_phase "CodeWriter - Project: $project_name"
+    
+    # Get project context
+    local project_context=$(get_project_context "$project_dir")
+    local language=$(detect_language "$prompt")
+    local memories=$(search_memory "$prompt")
+    
+    log_info "Language: $language | Project: $project_name"
+    [[ -n "$project_context" ]] && log_info "Context:\n$project_context"
+    [[ "$memories" != "No memories found." ]] && log_info "Related memories found"
+    
+    # Generate code
+    local response=$(generate_code "$prompt" "$project_context" "$language")
+    
+    # Save to memory
+    add_memory "$prompt" "$response" "$project_name" "$language"
+    
+    # Output the code
+    echo -e "\n${GREEN}=== GENERATED CODE ===${NC}"
+    echo "$response"
+    
+    # Offer to save to file
+    echo
+    read -p "Save to file? (Enter filename or press Enter to skip): " filename
+    if [[ -n "$filename" ]]; then
+        echo "$response" > "$filename"
+        log_success "Saved to $filename"
+        chmod +x "$filename" 2>/dev/null || true
+    fi
+}
+
+# --- COMMAND LINE INTERFACE ---
+show_help() {
+    cat << EOF
+Usage: ai [COMMAND] [OPTIONS]
+
+Universal CodeWriter & Git Assistant
+
+Commands:
+  code "your prompt"        Generate code for current project
+  git <operation> [path]    Git operations (status, pull, push, sync, clone)
+  memory [search]           Search code memory
+  setup-ssh "key"           Setup SSH key for Git
+  config                    Show configuration
+  
+Git Operations:
+  ai git status [path]      Show repository status
+  ai git pull [path]        Pull latest changes
+  ai git push [path]        Push changes with auto-commit
+  ai git sync [path]        Pull + push changes
+  ai git clone url [path]   Clone repository
+  
+Examples:
+  ai code "Create a Python Flask API with health endpoint"
+  ai code "Write a bash script to backup files"
+  ai git status ~/projects/myapp
+  ai setup-ssh "ssh-rsa AAAA..."
+
+Configuration:
+  Set AI_MODEL environment variable to change model (default: codellama:7b)
+  Supported models: codellama:7b, llama2:7b, mistral:7b, etc.
+EOF
+}
+
+main() {
+    init_dirs
+    init_db
+    
+    if [[ $# -eq 0 ]]; then
+        show_help
+        exit 0
+    fi
+    
+    case "$1" in
+        code|generate|write)
+            shift
+            code_writer "$*"
+            ;;
+            
+        git)
+            shift
+            if [[ $# -eq 0 ]]; then
+                git_operation "status" "."
+            else
+                git_operation "$1" "${2:-.}" "${3:-}"
+            fi
+            ;;
+            
+        memory|remember)
+            shift
+            search_memory "${*:-.}"
+            ;;
+            
+        setup-ssh)
+            if [[ $# -lt 2 ]]; then
+                log_error "SSH key content required"
+            fi
+            setup_ssh_key "$2"
+            test_ssh
+            ;;
+            
+        config|settings)
+            log_phase "Current Configuration"
+            echo "AI_HOME: $AI_HOME"
+            echo "Model: $MODEL"
+            echo "Projects: $PROJECTS_DIR"
+            echo "SSH Key: $GIT_SSH_KEY"
+            [[ -f "$GIT_SSH_KEY" ]] && echo "SSH: Configured" || echo "SSH: Not configured"
+            ;;
+            
+        help|--help|-h)
+            show_help
+            ;;
+            
+        *)
+            # Default to code generation if no command specified
+            code_writer "$*"
+            ;;
+    esac
+}
+
+# Run main function if script is executed directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

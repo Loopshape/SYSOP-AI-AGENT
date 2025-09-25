@@ -1,0 +1,298 @@
+#!/usr/bin/env zsh
+# ai.sh v8.6 - Git Operations Edition
+# Adds SSH key management and git operations to the triumvirate system
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# --- CONFIG ---
+AI_HOME="${AI_HOME:-$HOME/.ai_agent}"
+PROJECTS_DIR="${PROJECTS_DIR:-$HOME/ai_projects}"
+SSH_DIR="$HOME/.ssh"
+GIT_SSH_KEY="$SSH_DIR/id_ai_agent"
+
+# ... [keep all existing config and functions above] ...
+
+# --- SSH KEY MANAGEMENT ---
+setup_ssh_key() {
+    local ssh_key="$1"
+    
+    mkdir -p "$SSH_DIR"
+    chmod 700 "$SSH_DIR"
+    
+    # Save the SSH key
+    echo "$ssh_key" > "$GIT_SSH_KEY"
+    chmod 600 "$GIT_SSH_KEY"
+    
+    # Add to SSH config for easy usage
+    cat >> "$SSH_DIR/config" << EOF
+Host github.com
+    HostName github.com
+    User git
+    IdentityFile $GIT_SSH_KEY
+    IdentitiesOnly yes
+
+Host gitlab.com
+    HostName gitlab.com
+    User git
+    IdentityFile $GIT_SSH_KEY
+    IdentitiesOnly yes
+
+Host bitbucket.org
+    HostName bitbucket.org
+    User git
+    IdentityFile $GIT_SSH_KEY
+    IdentitiesOnly yes
+EOF
+    chmod 600 "$SSH_DIR/config"
+    
+    log_success "SSH key configured at: $GIT_SSH_KEY"
+}
+
+test_ssh_connection() {
+    local host="${1:-github.com}"
+    log_info "Testing SSH connection to $host..."
+    
+    if ssh -T -o ConnectTimeout=10 -o StrictHostKeyChecking=no git@$host 2>&1 | grep -q "successfully authenticated"; then
+        log_success "SSH connection to $host successful"
+        return 0
+    else
+        log_warn "SSH connection test inconclusive (this is normal for GitHub)"
+        return 0
+    fi
+}
+
+# --- GIT OPERATIONS ---
+run_git_operations() {
+    local operation="$1"
+    local repo_path="${2:-.}"
+    local additional_args="${3:-}"
+    
+    if [[ ! -d "$repo_path/.git" ]]; then
+        log_error "Not a git repository: $repo_path"
+        return 1
+    fi
+    
+    cd "$repo_path"
+    
+    case "$operation" in
+        "pull")
+            log_phase "GIT PULL OPERATION"
+            log_info "Repository: $(pwd)"
+            log_info "Current branch: $(git branch --show-current)"
+            
+            # Fetch and pull with SSH
+            GIT_SSH_COMMAND="ssh -i $GIT_SSH_KEY -o IdentitiesOnly=yes" git fetch --all
+            GIT_SSH_COMMAND="ssh -i $GIT_SSH_KEY -o IdentitiesOnly=yes" git pull $additional_args
+            ;;
+            
+        "push")
+            log_phase "GIT PUSH OPERATION"
+            log_info "Repository: $(pwd)"
+            log_info "Current branch: $(git branch --show-current)"
+            
+            # Check if there are changes to push
+            if git diff --quiet && git diff --cached --quiet; then
+                log_warn "No changes to push"
+                return 0
+            fi
+            
+            # Show what will be pushed
+            log_info "Changes to be pushed:"
+            git status --short
+            
+            # Push with SSH
+            GIT_SSH_COMMAND="ssh -i $GIT_SSH_KEY -o IdentitiesOnly=yes" git push $additional_args
+            ;;
+            
+        "status")
+            log_phase "GIT STATUS"
+            git status
+            git log --oneline -5
+            ;;
+            
+        "sync")
+            log_phase "GIT SYNC (PULL + PUSH)"
+            run_git_operations "pull" "$repo_path" "$additional_args"
+            run_git_operations "push" "$repo_path" "$additional_args"
+            ;;
+            
+        *)
+            log_error "Unknown git operation: $operation"
+            return 1
+            ;;
+    esac
+}
+
+# --- GIT-FOCUSED TRIUMVIRATE ---
+run_git_triumvirate() {
+    local git_command="$1"
+    local repo_path="${2:-.}"
+    local task_id=$(gen_task_id "git-$git_command")
+    local task_dir="$PROJECTS_DIR/$task_id"
+    
+    mkdir -p "$task_dir"
+    log_phase "GIT OPERATION: $git_command on $(basename $repo_path)"
+    log_success "Task ID: $task_id"
+    
+    # Get repository info for context
+    cd "$repo_path"
+    local repo_info="Repository: $(pwd)
+Branch: $(git branch --show-current 2>/dev/null || echo 'detached')
+Remote: $(git remote -v | head -1)
+Status: $(git status --short 2>/dev/null || echo 'unknown')"
+    
+    local relevant_memories=$(search_memory "git $git_command")
+    
+    log_phase "PHASE 1: GIT ANALYSIS"
+    local messenger_prompt="You are GIT MESSENGER. Analyze the repository state and determine the best approach for: $git_command
+Repository Info:
+$repo_info
+
+Consider: conflicts, upstream changes, branch status, and potential issues."
+
+    local combinator_prompt="You are GIT COMBINATOR. Plan the exact git commands and sequence for: $git_command
+Repository Info:
+$repo_info
+
+Provide specific command sequences and handle edge cases."
+
+    # Run git analysis in screen sessions
+    start_screen_session "$task_id-messenger" "run_worker_raw '$MESSENGER_MODEL' '$messenger_prompt' '$relevant_memories' | tee '$task_dir/messenger.log'"
+    start_screen_session "$task_id-combinator" "run_worker_raw '$COMBINATOR_MODEL' '$combinator_prompt' '$relevant_memories' | tee '$task_dir/combinator.log'"
+    
+    # Wait for analysis to complete
+    sleep 5
+    
+    local messenger_response=$(<"$task_dir/messenger.log")
+    local combinator_response=$(<"$task_dir/combinator.log")
+    
+    log_phase "PHASE 2: EXECUTION PLANNING"
+    local trader_prompt="You are GIT TRADER. Create an execution plan for: $git_command
+
+MESSENGER ANALYSIS:
+$messenger_response
+
+COMBINATOR COMMAND PLAN:
+$combinator_response
+
+Provide the final execution plan with [GIT_PLAN] tags."
+
+    start_screen_session "$task_id-trader" "run_worker_raw '$TRADER_MODEL' '$trader_prompt' '$relevant_memories' | tee '$task_dir/trader.log'"
+    sleep 3
+    
+    local trader_response=$(<"$task_dir/trader.log")
+    
+    log_phase "PHASE 3: EXECUTION"
+    if echo "$trader_response" | grep -q '\[GIT_PLAN\]'; then
+        log_success "Execution plan ready!"
+        echo "$trader_response"
+        
+        # Ask for confirmation before executing git commands
+        echo -n "Execute this git operation? (y/N): "
+        read -r response
+        if [[ "$response" =~ ^[Yy]$ ]]; then
+            run_git_operations "$git_command" "$repo_path"
+            add_to_memory "git $git_command" "$trader_response" "$task_id"
+        else
+            log_info "Git operation cancelled by user"
+        fi
+    else
+        log_warn "No clear execution plan generated"
+        echo "$trader_response"
+    fi
+}
+
+# --- ENHANCED MAIN FUNCTION ---
+main() {
+    init_db
+    load_config_values
+
+    if [[ $# -eq 0 ]]; then
+        echo "Usage: $0 [OPTIONS] \"Your high-level goal\""
+        echo "Git Operations: $0 --git <pull|push|sync|status> [repo_path]"
+        echo "SSH Setup: $0 --setup-ssh \"SSH_PRIVATE_KEY\""
+        exit 0
+    fi
+
+    case "$1" in
+        --setup)
+            log_info "Installing dependencies..."
+            if command -v apt-get &>/dev/null; then
+                sudo apt-get update && sudo apt-get install -y sqlite3 jq curl tree lynx screen git
+            elif command -v brew &>/dev/null; then
+                brew install sqlite jq curl tree lynx screen git
+            fi
+            log_success "Setup complete."
+            ;;
+
+        --setup-ssh)
+            if [[ $# -lt 2 ]]; then
+                log_error "SSH key required: $0 --setup-ssh \"SSH_PRIVATE_KEY\""
+            fi
+            setup_ssh_key "$2"
+            test_ssh_connection "github.com"
+            ;;
+
+        --git)
+            if [[ $# -lt 2 ]]; then
+                log_error "Git operation required: pull, push, sync, status"
+            fi
+            local git_op="$2"
+            local repo_path="${3:-.}"
+            
+            # Check if SSH key is set up
+            if [[ ! -f "$GIT_SSH_KEY" ]]; then
+                log_warn "SSH key not configured. Run: $0 --setup-ssh \"SSH_PRIVATE_KEY\""
+                echo -n "Continue without SSH key? (y/N): "
+                read -r response
+                if [[ ! "$response" =~ ^[Yy]$ ]]; then
+                    exit 1
+                fi
+            else
+                test_ssh_connection "github.com"
+            fi
+            
+            run_git_triumvirate "$git_op" "$repo_path"
+            ;;
+
+        --git-direct)
+            if [[ $# -lt 2 ]]; then
+                log_error "Git operation required: pull, push, sync, status"
+            fi
+            local git_op="$2"
+            local repo_path="${3:-.}"
+            run_git_operations "$git_op" "$repo_path"
+            ;;
+
+        --help)
+            cat << EOF
+Usage: $0 [OPTIONS]
+
+AI Agent with Git Operations:
+
+Triumvirate Mode:
+  $0 "Your high-level goal"        # Run full AI triumvirate
+
+Git Operations:
+  $0 --setup-ssh "SSH_KEY"         # Setup SSH key for git operations
+  $0 --git pull [path]             # Smart git pull with AI analysis
+  $0 --git push [path]             # Smart git push with AI analysis  
+  $0 --git sync [path]             # Smart git pull + push
+  $0 --git status [path]           # Repository status with AI insights
+  $0 --git-direct pull [path]      # Direct git pull (no AI analysis)
+
+Examples:
+  $0 --setup-ssh "ssh-rsa AAAA..."
+  $0 --git pull ~/my-project
+  $0 "Analyze the codebase and suggest improvements"
+EOF
+            ;;
+
+        *)
+            run_triumvirate_agent "$*"
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then main "$@"; fi
