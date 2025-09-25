@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
 
 # ai - Main Dispatcher for the SYSOP-AI-AGENT Platform
-# Version 10.0 - The Sysop Integration Edition
+# Version 10.1 - Fixed robust path discovery
 
 # --- Project Root & Source Loading ---
-# Find the script's own directory, so it can be run from anywhere
-SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
-PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
+# FIX: Robustly find the script's own directory, then determine the project root.
+# This ensures that no matter where the script is called from (e.g., via a symlink in /usr/local/bin),
+# it can always locate its own modules in the 'src' directory.
+SOURCE=${BASH_SOURCE[0]}
+while [ -L "$SOURCE" ]; do # resolve $SOURCE until the file is no longer a symlink
+  DIR=$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )
+  SOURCE=$(readlink "$SOURCE")
+  [[ $SOURCE != /* ]] && SOURCE=$DIR/$SOURCE # if $SOURCE was a relative symlink, we need to resolve it relative to the path where the symlink file was located
+done
+SCRIPT_DIR=$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )
+PROJECT_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
 
-# Source all the necessary modules
+# Source all the necessary modules using the now-correct PROJECT_ROOT
 source "$PROJECT_ROOT/src/utils.sh"
 source "$PROJECT_ROOT/src/config.sh"
 source "$PROJECT_ROOT/src/tools.sh"
@@ -16,14 +24,13 @@ source "$PROJECT_ROOT/src/core.sh"
 
 # --- MAIN DISPATCHER ---
 main() {
-    # On first run, or if config is missing, offer to run setup
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        log_warn "Configuration file not found. It's recommended to run the installer first."
-        log_info "Run: bash $PROJECT_ROOT/install.sh"
+    # On first run, or if config is missing, guide the user.
+    if ! load_config_values; then
+        log_warn "Configuration file not found or invalid at '$CONFIG_FILE'."
+        log_info "Please run the installer to create a default configuration:"
+        log_info "bash $PROJECT_ROOT/install.sh"
+        exit 1
     fi
-    
-    # Load all configuration values into shell variables
-    load_config_values
     
     # Ensure core databases exist
     init_db
@@ -71,7 +78,4 @@ main() {
 }
 
 # --- ENTRY POINT ---
-# Run if the script is executed directly
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    main "$@"
-fi
+main "$@"
