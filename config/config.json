@@ -1,0 +1,12 @@
+{
+  "models": {
+    "agent": "llama3.1:8b",
+    "coder": "codellama:7b",
+    "reviewer": "2244-1",
+    "tester": "deepseek-coder:6.7b-instruct",
+    "messenger": "gemma3:1b",
+    "combinator": "deepseek-r1:1.5b",
+    "trader": "2244-1"
+  },
+  "ollama_bin": "/home/linuxbrew/.linuxbrew/bin/ollama"
+}
