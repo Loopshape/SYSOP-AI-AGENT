@@ -1,81 +1,183 @@
 #!/usr/bin/env bash
+# ai.sh - AI DevOps Platform v10.0 - The Unified DevOps Agent
+# A single, powerful script combining a Coder-AGI workflow with direct-action developer tools.
 
-# ai - Main Dispatcher for the SYSOP-AI-AGENT Platform
-# Version 10.1 - Fixed robust path discovery
+set -euo pipefail
+IFS=$'\n\t'
 
-# --- Project Root & Source Loading ---
-# FIX: Robustly find the script's own directory, then determine the project root.
-# This ensures that no matter where the script is called from (e.g., via a symlink in /usr/local/bin),
-# it can always locate its own modules in the 'src' directory.
-SOURCE=${BASH_SOURCE[0]}
-while [ -L "$SOURCE" ]; do # resolve $SOURCE until the file is no longer a symlink
-  DIR=$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )
-  SOURCE=$(readlink "$SOURCE")
-  [[ $SOURCE != /* ]] && SOURCE=$DIR/$SOURCE # if $SOURCE was a relative symlink, we need to resolve it relative to the path where the symlink file was located
-done
-SCRIPT_DIR=$( cd -P "$( dirname "$SOURCE" )" >/dev/null 2>&1 && pwd )
-PROJECT_ROOT=$(cd "$SCRIPT_DIR/.." && pwd)
+# --- CONFIGURATION ---
+AI_HOME="${AI_HOME:-$HOME/.ai_agent}"
+PROJECTS_DIR="${PROJECTS_DIR:-$HOME/ai_projects}"
+SSH_DIR="$HOME/.ssh"
+GIT_SSH_KEY="$SSH_DIR/id_ai_agent"
 
-# Source all the necessary modules using the now-correct PROJECT_ROOT
-source "$PROJECT_ROOT/src/utils.sh"
-source "$PROJECT_ROOT/src/config.sh"
-source "$PROJECT_ROOT/src/tools.sh"
-source "$PROJECT_ROOT/src/core.sh"
+# --- Default AI Models (can be overridden via --config) ---
+DEFAULT_AGENT_MODEL="llama3.1:8b" # A powerful model for general reasoning and coding
+DEFAULT_REVIEWER_MODEL="2244-1" # A fast, logical model for critiques
+DEFAULT_TESTER_MODEL="deepseek-coder:6.7b-instruct" # Specialized for writing tests
 
-# --- MAIN DISPATCHER ---
+# Initialize with defaults - will be overridden by config
+AGENT_MODEL=""
+REVIEWER_MODEL=""
+TESTER_MODEL=""
+
+OLLAMA_BIN="$(command -v ollama || true)"
+MEMORY_DB="$AI_HOME/memory.db"
+CONFIG_DB="$AI_HOME/config.db"
+MAX_AGENT_LOOPS=5
+
+# --- COLORS & LOGGING ---
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'; NC='\033[0m'
+log() { printf "${BLUE}[%s]${NC} %s\n" "$(date '+%T')" "$*"; }
+log_success() { log "${GREEN}$*${NC}"; }
+log_warn() { log "${YELLOW}WARN: $*${NC}"; }
+log_error() { log "${RED}ERROR: $*${NC}"; exit 1; }
+log_info() { log "${CYAN}$*${NC}"; }
+log_phase() {
+    echo -e "\n${PURPLE}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}"
+    log "${PURPLE}$*${NC}"
+}
+
+# --- BOOTSTRAP ---
+mkdir -p "$AI_HOME" "$PROJECTS_DIR" "$SSH_DIR"
+chmod 700 "$SSH_DIR" 2>/dev/null || true
+
+# --- DATABASE & CONFIG ---
+sqlite_escape() { echo "$1" | sed "s/'/''/g"; }
+init_db() {
+    if ! command -v sqlite3 &> /dev/null; then log_error "sqlite3 is required. Please run 'ai.sh --setup'"; fi
+    sqlite3 "$MEMORY_DB" "CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY, timestamp DATETIME, prompt TEXT, project TEXT, code TEXT, review TEXT, tests TEXT, status TEXT);" 2>/dev/null || true
+    sqlite3 "$CONFIG_DB" "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);" 2>/dev/null || true
+}
+set_config() { local k="$1" v="$2"; sqlite3 "$CONFIG_DB" "INSERT OR REPLACE INTO config (key, value) VALUES ('$(sqlite_escape "$k")', '$(sqlite_escape "$v")');"; log_success "Config set: $k = $v"; }
+get_config() { sqlite3 "$CONFIG_DB" "SELECT value FROM config WHERE key = '$(sqlite_escape "$1")';" 2>/dev/null; }
+load_config_values() {
+    AGENT_MODEL=$(get_config agent_model || echo "$DEFAULT_AGENT_MODEL")
+    REVIEWER_MODEL=$(get_config reviewer_model || echo "$DEFAULT_REVIEWER_MODEL")
+    TESTER_MODEL=$(get_config tester_model || echo "$DEFAULT_TESTER_MODEL")
+}
+
+# --- MEMORY SYSTEM ---
+add_memory() { local p="$1" proj="$2" c="$3" r="$4" t="$5" s="$6"; sqlite3 "$MEMORY_DB" "INSERT INTO memories (prompt,project,code,review,tests,status) VALUES ('$(sqlite_escape "$p")','$proj','$(sqlite_escape "$c")','$(sqlite_escape "$r")','$(sqlite_escape "$t")','$s');" 2>/dev/null; }
+search_memory() { sqlite3 -header -column "$MEMORY_DB" "SELECT timestamp,prompt,project,status FROM memories WHERE prompt LIKE '%$(sqlite_escape "$1")%' ORDER BY timestamp DESC LIMIT 3;" 2>/dev/null; }
+
+# --- GIT & SSH ---
+setup_ssh_key() {
+    local key_content="$1"; echo -e "$key_content" > "$GIT_SSH_KEY"; chmod 600 "$GIT_SSH_KEY"
+    printf '%s\n' "Host *" "    IdentityFile $GIT_SSH_KEY" "    IdentitiesOnly yes" > "$SSH_DIR/config"
+    chmod 600 "$SSH_DIR/config"; log_success "SSH key configured."
+}
+git_operation() {
+    local op="$1" repo_path="${2:-.}"; if [[ ! -d "$repo_path/.git" ]]; then log_error "Not a git repository: $repo_path"; fi
+    cd "$repo_path"; log_phase "Git $op"
+    case "$op" in
+        status) git status;;
+        pull) GIT_SSH_COMMAND="ssh -i $GIT_SSH_KEY" git pull;;
+        push) git add .; read -p "Commit message: " msg; git commit -m "${msg:-ai: auto-commit}"; GIT_SSH_COMMAND="ssh -i $GIT_SSH_KEY" git push;;
+        *) log_error "Unknown git op: $op";;
+    esac
+}
+
+# --- AI MODEL INTERACTION ---
+ensure_ollama_server() { if ! pgrep -f "ollama serve" >/dev/null; then log "Ollama starting..."; nohup "$OLLAMA_BIN" serve >/dev/null 2>&1 & sleep 3; fi; }
+run_model_streaming() {
+    local model="$1" prompt="$2"; ensure_ollama_server
+    if ! "$OLLAMA_BIN" list | grep -q "^${model}"; then log "Model $model not found. Pulling..."; "$OLLAMA_BIN" pull "$model"; fi
+    log_info "Querying model ${CYAN}$model${NC}..."; echo -e "${GREEN}--- AI Response (Live Stream) ---${NC}"
+    # Use process substitution to capture the full response while streaming
+    local full_response
+    full_response=$("$OLLAMA_BIN" run "$model" "$prompt" | tee /dev/tty)
+    echo "$full_response"
+}
+confirm_action() { echo -e "\n${YELLOW}PROPOSED ACTION:${NC} ${CYAN}$1${NC}"; read -p "Approve? [y/N] " -n 1 -r c; echo; [[ "$c" =~ ^[Yy]$ ]]; }
+
+# --- AGENT TOOLS ---
+tool_run_command() {
+    local cwd="$1" cmd="$2"
+    if confirm_action "Run command in '$cwd': $cmd"; then
+        (cd "$cwd" && eval "$cmd") 2>&1 || true
+    else
+        echo "User aborted command execution."
+        return 1
+    fi
+}
+
+# --- CODER-AGI WORKFLOW (Default Agent Mode) ---
+run_coder_agi_agent() {
+    local user_prompt="$*"
+    local project_name; project_name=$(echo "$user_prompt" | tr ' ' '-' | tr -cd 'a-zA-Z0-9-' | cut -c1-32)
+    local project_dir="$PROJECTS_DIR/$project_name"; mkdir -p "$project_dir"; cd "$project_dir"
+    log_success "Created project workspace: $project_dir"
+
+    local language; language=$(run_model_streaming "$AGENT_MODEL" "Detect the primary programming language from this prompt (e.g., python, javascript, bash). Output ONLY the language name. Prompt: $user_prompt")
+    local main_file="main.${language/javascript/js}"; local test_file="test_main.${language/javascript/js}"
+    log_info "Detected language: $language. Main file will be '$main_file'"
+
+    local code="" review="" tests="" test_output="" status="IN_PROGRESS"
+    for (( i=1; i<=MAX_AGENT_LOOPS; i++ )); do
+        log_phase "Coder-AGI Loop $i/$MAX_AGENT_LOOPS - STATUS: $status"
+        # 1. Coder
+        local coder_prompt="You are CODER. Your goal is to write a complete, functional script for '$main_file'. Output ONLY the code. Request: $user_prompt. Reviewer Feedback: ${review:-None}. Test Failure Output: ${test_output:-None}"
+        code=$(run_model_streaming "$AGENT_MODEL" "$coder_prompt"); echo "$code" > "$main_file"; log_success "Coder has written v$i of '$main_file'."
+        # 2. Reviewer
+        review=$(run_model_streaming "$REVIEWER_MODEL" "You are REVIEWER. Critique this code. If perfect, respond ONLY with 'LGTM'. Code:\n$code"); log_success "Reviewer has provided feedback."
+        # 3. Refinement
+        if [[ "$review" != "LGTM" ]]; then
+            code=$(run_model_streaming "$AGENT_MODEL" "You are CODER. Refactor the code based on the review. Output ONLY the code.\nReview:\n$review\nCode:\n$code"); echo "$code" > "$main_file"; log_success "Coder refined '$main_file'."
+        fi
+        # 4. Tester
+        tests=$(run_model_streaming "$TESTER_MODEL" "You are TESTER. Write a test script for '$test_file' to validate the code. Use standard libraries (pytest for python, jest for javascript). Output ONLY the code.\nCode:\n$code"); echo "$tests" > "$test_file"; log_success "Tester wrote '$test_file'."
+        # 5. Verification
+        log_phase "VERIFICATION"
+        local test_cmd=""; case "$language" in python) test_cmd="pip install pytest > /dev/null && python3 -m pytest $test_file";; javascript) test_cmd="npm install jest > /dev/null && npx jest $test_file";; *) status="MANUAL_VERIFICATION"; break;; esac
+        test_output=$(tool_run_command "$project_dir" "$test_cmd")
+        if [[ $? -eq 0 && ! "$test_output" =~ "failed" && ! "$test_output" =~ "FAIL" ]]; then log_success "All tests passed!"; status="SUCCESS"; break;
+        else log_warn "Tests failed. The agent will retry."; echo -e "${RED}--- TEST OUTPUT ---${NC}\n$test_output"; status="TESTS_FAILED"; fi
+    done
+    add_memory "$user_prompt" "$project_name" "$code" "$review" "$tests" "$status"
+    log_phase "AGENT FINISHED - FINAL STATUS: $status"; log_info "All artifacts are in: $project_dir"
+}
+
+# --- HELP & MAIN DISPATCHER ---
+show_help() {
+    printf "${GREEN}AI DevOps Platform v10.0 - The Grand Unified Agent${NC}\n\n"
+    printf "An autonomous software development agent with a full suite of DevOps tools.\n\n"
+    printf "${CYAN}MODES OF OPERATION:${NC}\n"
+    printf "  ${GREEN}ai git${NC} <op> [path]            Acts as a Git assistant. Ops: status, pull, push.\n"
+    printf "  ${GREEN}ai${NC} \"<prompt>\"                 (Default) Activates the Coder-AGI to build & test a solution.\n\n"
+    printf "${CYAN}UTILITY COMMANDS:${NC}\n"
+    printf "  ${GREEN}ai setup-ssh${NC} \"key content\"  Sets up the SSH key for Git operations.\n"
+    printf "  ${GREEN}ai memory${NC} <search|clear>     Manage the agent's long-term memory.\n"
+    printf "  ${GREEN}ai config${NC} <view|get|set>     Manage agent configuration.\n"
+    printf "  ${GREEN}ai --setup${NC}                    Installs dependencies and sets up default configuration.\n"
+    printf "  ${GREEN}ai --help${NC}                     Show this help message.\n\n"
+    printf "${CYAN}EXAMPLE:${NC}\n"
+    printf "  ${CYAN}ai \"Create a Python Flask API with a single route that returns a JSON message\"${NC}\n"
+}
+
 main() {
-    # On first run, or if config is missing, guide the user.
-    if ! load_config_values; then
-        log_warn "Configuration file not found or invalid at '$CONFIG_FILE'."
-        log_info "Please run the installer to create a default configuration:"
-        log_info "bash $PROJECT_ROOT/install.sh"
-        exit 1
-    fi
-    
-    # Ensure core databases exist
-    init_db
-    
-    if [[ $# -eq 0 ]]; then
-        show_help
-        exit 0
-    fi
+    init_db; load_config_values
+    if [[ $# -eq 0 ]]; then show_help; exit 0; fi
 
-    # Handle top-level commands
     case "$1" in
         --setup)
-            bash "$PROJECT_ROOT/install.sh"
-            ;;
-        --help|-h)
-            show_help
-            ;;
-        # --- Direct Action Modes ---
-        git)
-            shift
-            git_operation "${1:-status}" "${2:-.}"
-            ;;
-        memory)
-            shift
-            memory_operation "${1:-search}" "${*:-}"
-            ;;
-        config)
-            shift
-            config_operation "${1:-view}" "${2:-}" "${3:-}"
-            ;;
-        # --- Agent Modes ---
-        agent)
-            shift
-            run_coder_agi_agent "$@"
-            ;;
-        triumvirate)
-            shift
-            run_triumvirate_agent "$@"
-            ;;
-        *)
-            # Default to the primary Coder-AGI agent for any other prompt
-            run_coder_agi_agent "$@"
-            ;;
+            log_info "Setting up environment and dependencies..."
+            if command -v apt-get &>/dev/null; then sudo apt-get update && sudo apt-get install -y sqlite3 git tree npm;
+            elif command -v brew &>/dev/null; then brew install sqlite git tree node; fi
+            set_config agent_model "$DEFAULT_AGENT_MODEL"
+            set_config reviewer_model "$DEFAULT_REVIEWER_MODEL"
+            set_config tester_model "$DEFAULT_TESTER_MODEL"
+            log_success "Setup complete." ;;
+        --help|-h) show_help ;;
+        git) shift; git_operation "${1:-status}" "${2:-.}" ;;
+        memory) shift; case "${1:-search}" in search) search_memory "$2";; clear) if confirm_action "Clear ALL memory?"; then sqlite3 "$MEMORY_DB" "DELETE FROM memories;"; fi;; *) log_error "Usage";; esac ;;
+        config) shift; case "${1:-view}" in view) sqlite3 -header -column "$CONFIG_DB" "SELECT * FROM config;";; get) get_config "$2";; set) set_config "$2" "$3";; *) log_error "Usage";; esac ;;
+        setup-ssh) if [[ $# -lt 2 ]]; then log_error "SSH key content required."; fi; setup_ssh_key "$2" ;;
+        *) run_coder_agi_agent "$@" ;;
     esac
 }
 
 # --- ENTRY POINT ---
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
