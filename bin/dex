@@ -1,649 +1,173 @@
 #!/usr/bin/env bash
-# ai.sh - AI DevOps Platform v8.1 - Adaptive Triumvirate Mind Edition
-# Full single-file Bash implementation for advanced AI agent operations.
+# dex - AI DevOps Agent v16.1 - Singlefile CLI + WS Monokai Dashboard
 
 set -euo pipefail
 IFS=$'\n\t'
 
-# --- CONFIGURATION ---
 AI_HOME="${AI_HOME:-$HOME/.ai_agent}"
 PROJECTS_DIR="${PROJECTS_DIR:-$HOME/ai_projects}"
-
-# Worker Models (configurable via --config set model.<worker>)
-MESSENGER_MODEL="${MESSENGER_MODEL:-gemma3:1b}"
-COMBINATOR_MODEL="${COMBINATOR_MODEL:-deepseek-r1:1.5b}"
-TRADER_MODEL="${TRADER_MODEL:-2244-1}" # Mandatory executive model
-
 OLLAMA_BIN="$(command -v ollama || true)"
 MEMORY_DB="$AI_HOME/memory.db"
-HASH_INDEX_DB="$AI_HOME/hashes.db"
-POOL_INDEX_DB="$AI_HOME/pool_index.db"
-API_LOGS_DB="$AI_HOME/api_logs.db"
 CONFIG_DB="$AI_HOME/config.db"
+WS_PORT="${WS_PORT:-8081}"
+DEFAULT_MODEL="gemma3:1b"
+AGENT_MODEL="${AI_MODEL:-$DEFAULT_MODEL}"
 
-API_PORT="${API_PORT:-8080}"
-API_PID_FILE="$AI_HOME/api.pid"
-MAX_AGENT_ITERATIONS=10 # Max iterations for a worker's internal loop
-MAX_TRIUMVIRATE_ROUNDS=5 # Max rounds for the whole M->C->T cycle
-
-# --- COLORS & LOGGING ---
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'; NC='\033[0m'
-log() { printf "${BLUE}[%s]${NC} %s\\n" "$(date '+%T')" "$*"; }
-log_success() { log "${GREEN}$*${NC}"; }
-log_warn() { log "${YELLOW}WARN: $*${NC}"; }
-log_error() { log "${RED}ERROR: $*${NC}"; exit 1; }
-log_info() { log "${CYAN}$*${NC}"; }
-log_worker_start() { log "${PURPLE}--- WORKER: $1 ($2) ---${NC}"; echo -e "${CYAN}--- AI Thinking (Live Stream) ---${NC}"; }
-log_worker_end() { echo -e "${CYAN}--- End of Worker Thought ---${NC}"; }
-
-# --- BOOTSTRAP ---
 mkdir -p "$AI_HOME" "$PROJECTS_DIR"
 
-# --- SQLite UTILITIES ---
+# --- COLORS & LOGGING ---
+log() { echo -e "[\033[36mINFO\033[0m] $*"; }
+log_warn() { echo -e "[\033[33mWARN\033[0m] $*"; }
+log_error() { echo -e "[\033[31mERROR\033[0m] $*"; exit 1; }
+log_success() { echo -e "[\033[32mOK\033[0m] $*"; }
+
+# --- DATABASE ---
 sqlite_escape() { echo "$1" | sed "s/'/''/g"; }
 init_db() {
-    if ! command -v sqlite3 &> /dev/null; then
-        log_error "sqlite3 is required. Install with: sudo apt-get install sqlite3 or brew install sqlite"
-    fi
-    sqlite3 "$MEMORY_DB" "CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, prompt TEXT, response TEXT, pool_hash TEXT, task_hash TEXT);" 2>/dev/null || true
-    sqlite3 "$HASH_INDEX_DB" "CREATE TABLE IF NOT EXISTS hashes (type TEXT, target TEXT, hash TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP);" 2>/dev/null || true
-    sqlite3 "$CONFIG_DB" "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);" 2>/dev/null || true
-    sqlite3 "$POOL_INDEX_DB" "CREATE TABLE IF NOT EXISTS pools (pool_hash TEXT PRIMARY KEY, rehash_count INTEGER DEFAULT 0, tasks TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP);" 2>/dev/null || true
-    sqlite3 "$API_LOGS_DB" "CREATE TABLE IF NOT EXISTS api_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, endpoint TEXT, method TEXT, payload TEXT);" 2>/dev/null || true
+  sqlite3 "$MEMORY_DB" "CREATE TABLE IF NOT EXISTS memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    prompt TEXT,
+    response TEXT,
+    file_path TEXT
+  );" 2>/dev/null || true
+}
+add_to_memory() {
+  sqlite3 "$MEMORY_DB" "INSERT INTO memories (prompt,response,file_path)
+    VALUES ('$(sqlite_escape "$1")','$(sqlite_escape "$2")','$(sqlite_escape "$3")');"
 }
 
-# --- MEMORY MANAGEMENT ---
-add_to_memory() { local p="$1" r="$2" ph="$3" th="$4"; sqlite3 "$MEMORY_DB" "INSERT INTO memories (prompt, response, pool_hash, task_hash) VALUES ('$(sqlite_escape "$p")', '$(sqlite_escape "$r")', '$ph', '$th');" 2>/dev/null; }
-search_memory() { local q="$1" l="${2:-5}"; sqlite3 -header -column "$MEMORY_DB" "SELECT timestamp,prompt,response FROM memories WHERE prompt LIKE '%$(sqlite_escape "$q")%' OR response LIKE '%$(sqlite_escape "$q")%' ORDER BY timestamp DESC LIMIT $l;" 2>/dev/null; }
-clear_memory() { if confirm_action "Clear ALL memory data"; then sqlite3 "$MEMORY_DB" "DELETE FROM memories;"; log_success "Memory cleared."; else log_info "Memory clear cancelled."; fi; }
-
-# --- HASHING ---
-hash_string() { echo -n "$1" | sha256sum | cut -d' ' -f1; }
-hash_file_content() { if [[ -f "$1" ]]; then sha256sum "$1" | cut -d' ' -f1; else echo "ERROR: File not found: $1"; return 1; fi; }
-hash_repo_content() { if [[ -d "$1" ]]; then find "$1" -type f ! -path "*/.git/*" -exec cat {} + 2>/dev/null | sha256sum | cut -d' ' -f1; else echo "ERROR: Directory not found: $1"; return 1; fi; }
-
-record_hash() { local type="$1" target="$2" hash="$3"; sqlite3 "$HASH_INDEX_DB" "INSERT OR REPLACE INTO hashes (type, target, hash) VALUES ('$type', '$(sqlite_escape "$target")', '$hash');"; log_info "Recorded hash for $type:$target -> $hash"; }
-get_hash() { local type="$1" target="$2"; sqlite3 "$HASH_INDEX_DB" "SELECT hash FROM hashes WHERE type='$type' AND target='$(sqlite_escape "$target")';" 2>/dev/null; }
-view_hash_index() { sqlite3 -header -column "$HASH_INDEX_DB" "SELECT * FROM hashes ORDER BY timestamp DESC;" 2>/dev/null || echo "No hashes recorded."; }
-
-# --- CONFIGURATION MANAGEMENT ---
-set_config() { local k="$1" v="$2"; sqlite3 "$CONFIG_DB" "INSERT OR REPLACE INTO config (key, value) VALUES ('$k', '$(sqlite_escape "$v")');"; log_success "Config set: $k = $v"; }
-get_config() { local k="$1"; sqlite3 "$CONFIG_DB" "SELECT value FROM config WHERE key = '$k';" 2>/dev/null; }
-view_config() { sqlite3 -header -column "$CONFIG_DB" "SELECT * FROM config;" 2>/dev/null || echo "No configuration set."; }
-
-load_config_values() {
-    MESSENGER_MODEL="$(get_config messenger_model || echo "gemma3:1b")"
-    COMBINATOR_MODEL="$(get_config combinator_model || echo "deepseek-r1:1.5b")"
-    TRADER_MODEL="$(get_config trader_model || echo "2244-1")"
-    AI_TEMPERATURE="$(get_config temperature || echo "0.7")"
-    AI_TOP_P="$(get_config top_p || echo "0.9")"
-    AI_SEED="$(get_config seed || echo "")"
-    API_PORT="$(get_config api_port || echo "8080")"
+# --- TOOLING ---
+write_file() {
+  local path="$1"; local content="$2"
+  mkdir -p "$(dirname "$path")"
+  echo -e "$content" > "$path"
+  log_success "Code written to $path"
+}
+lint_beautify() {
+  local path="$1"; local ext="${path##*.}"
+  if command -v prettier >/dev/null && [[ "$ext" == js || "$ext" == ts ]]; then
+    prettier --write "$path" >/dev/null 2>&1
+  elif command -v black >/dev/null && [[ "$ext" == py ]]; then
+    black "$path" >/dev/null 2>&1
+  fi
 }
 
-# --- TASK POOLING ---
-setup_task_pool() {
-    local prompt="$1"
-    local semantic_hash_val
-    semantic_hash_val=$(run_worker_raw "SEMANTIC_HASH" "$MESSENGER_MODEL" "Extract core keywords (2-5 words, hyphenated) from: '$prompt'. Output ONLY the keywords." "" | head -n 1 | sed 's/[^a-zA-Z0-9-]/-/g' | cut -c1-16)
-    if [[ -z "$semantic_hash_val" ]]; then
-        semantic_hash_val=$(hash_string "$prompt" | cut -c1-16)
-        log_warn "AI failed to extract semantic hash. Using raw prompt hash: $semantic_hash_val"
-    fi
-
-    local instance_hash_val=$(hash_string "$prompt$(date +%s%N)" | cut -c1-16)
-
-    local pool_dir="$PROJECTS_DIR/$semantic_hash_val"
-    mkdir -p "$pool_dir"
-
-    local rehash_count=0
-    local tasks_json='[]'
-    local existing_data
-    existing_data=$(sqlite3 "$POOL_INDEX_DB" "SELECT rehash_count, tasks FROM pools WHERE pool_hash = '$semantic_hash_val';" 2>/dev/null || echo "")
-    
-    if [[ -n "$existing_data" ]]; then
-        rehash_count=$(echo "$existing_data" | cut -d'|' -f1)
-        local existing_tasks=$(echo "$existing_data" | cut -d'|' -f2)
-        rehash_count=$((rehash_count + 1))
-        tasks_json=$(echo "$existing_tasks" | jq -c --arg task "$instance_hash_val" '. + [$task]' 2>/dev/null || echo "[\"$instance_hash_val\"]")
-        sqlite3 "$POOL_INDEX_DB" "UPDATE pools SET rehash_count = $rehash_count, tasks = '$(sqlite_escape "$tasks_json")' WHERE pool_hash = '$semantic_hash_val';" 2>/dev/null
-    else
-        rehash_count=1
-        tasks_json="[\"$instance_hash_val\"]"
-        sqlite3 "$POOL_INDEX_DB" "INSERT INTO pools (pool_hash, rehash_count, tasks) VALUES ('$semantic_hash_val', $rehash_count, '$(sqlite_escape "$tasks_json")');" 2>/dev/null
-    fi
-
-    echo "$semantic_hash_val $instance_hash_val $rehash_count"
+# --- AI WORKER ---
+ensure_ollama() {
+  if ! pgrep -f "ollama serve" >/dev/null; then
+    log "Starting Ollama server..."
+    nohup "$OLLAMA_BIN" serve >"$AI_HOME/ollama.log" 2>&1 &
+    sleep 5
+  fi
 }
 
-# --- CORE AGENT TOOLS ---
-confirm_action() {
-    local action="$1"
-    echo -e "${YELLOW}CONFIRM: $action${NC}"
-    read -p "Type 'yes' to confirm: " -r response
-    if [[ "$response" == "yes" ]]; then
-        return 0
-    else
-        return 1
+run_ai() {
+  ensure_ollama
+  local prompt="$1"
+  local fifo; fifo=$(mktemp -u)
+  mkfifo "$fifo"
+
+  local response=""
+  (ollama run "$AGENT_MODEL" "$prompt" > "$fifo" 2>&1) &
+  local pid=$!
+
+  while IFS= read -r line < "$fifo"; do
+    response+="$line"$'\n'
+    echo -e "[\033[36mAI\033[0m] $line"
+    if [[ -n "${WS_ACTIVE:-}" ]]; then
+      echo "$line" >> "$AI_HOME/ws_fifo"
     fi
+  done
+
+  wait "$pid"
+  rm -f "$fifo"
+  echo "$response"
 }
 
-tool_read_file() { local p="$1"; if [[ -f "$p" ]]; then cat "$p"; else echo "ERROR: File not found: $p"; fi; }
-tool_list_directory() { local p="${1:-.}"; if [[ -d "$p" ]]; then ls -la "$p"; else echo "ERROR: Directory not found: $p"; fi; }
-tool_web_search() { 
-    if ! command -v googler &> /dev/null; then echo "ERROR: googler not installed. Install with: sudo apt-get install googler"; return 1; fi
-    local query="$1"; local count="${2:-3}"
-    if confirm_action "Search web for: $query"; then
-        googler --count "$count" --exact "$query"
-    fi
-}
-tool_read_web_page() { 
-    if ! command -v lynx &> /dev/null; then echo "ERROR: lynx not installed. Install with: sudo apt-get install lynx"; return 1; fi
-    local url="$1"
-    if confirm_action "Read web page: $url"; then
-        lynx -dump "$url"
-    fi
-}
-tool_write_file() { 
-    local path="$1" content="$2"
-    if confirm_action "Write to file: $path"; then
-        mkdir -p "$(dirname "$path")"
-        echo "$content" > "$path"
-        echo "File written: $path"
-    fi
-}
-tool_create_directory() { 
-    local path="$1"
-    if confirm_action "Create directory: $path"; then
-        mkdir -p "$path"
-        echo "Directory created: $path"
-    fi
-}
-tool_copy_file() { 
-    local src="$1" dest="$2"
-    if confirm_action "Copy file: $src to $dest"; then
-        cp "$src" "$dest"
-        echo "File copied: $src -> $dest"
-    fi
-}
-tool_move_file() { 
-    local src="$1" dest="$2"
-    if confirm_action "Move file: $src to $dest"; then
-        mv "$src" "$dest"
-        echo "File moved: $src -> $dest"
-    fi
-}
-tool_delete_file() { 
-    local path="$1"
-    if confirm_action "DELETE file: $path"; then
-        rm "$path"
-        echo "File deleted: $path"
-    fi
-}
-tool_make_web_request() { 
-    local url="$1" method="${2:-GET}" data="${3:-}"
-    if confirm_action "Make $method request to: $url"; then
-        if [[ "$method" == "POST" ]]; then
-            curl -X POST -H "Content-Type: application/json" -d "$data" "$url"
-        else
-            curl "$url"
-        fi
-    fi
-}
-tool_check_port() { 
-    local host="$1" port="$2"
-    if command -v nc &> /dev/null; then
-        nc -z "$host" "$port" && echo "Port $port on $host is open" || echo "Port $port on $host is closed"
-    else
-        echo "ERROR: netcat (nc) not installed"
-    fi
-}
-tool_download_file() { 
-    local url="$1" dest="$2"
-    if confirm_action "Download: $url to $dest"; then
-        wget -O "$dest" "$url"
-        echo "Downloaded: $url -> $dest"
-    fi
-}
-tool_run_command() { 
-    local cmd="$1"
-    local project_root
-    project_root=$(get_config current_project_root || echo ".")
-    
-    if confirm_action "Run command: $cmd (in: $project_root)"; then
-        (cd "$project_root" && eval "$cmd")
-    fi
+# --- TRIUMVIRATE WORKFLOW ---
+run_triumvirate() {
+  local prompt="$*"
+  local task_dir="$PROJECTS_DIR/$(date +%s%N)"
+  mkdir -p "$task_dir"
+
+  log "Running AI worker..."
+  local code; code=$(run_ai "$prompt")
+
+  local lang="js"
+  [[ "$code" == *"def "* ]] && lang="py"
+  local file_path="$task_dir/main.$lang"
+  write_file "$file_path" "$code"
+  lint_beautify "$file_path"
+
+  add_to_memory "$prompt" "$code" "$file_path"
 }
 
-# --- AI WORKER FUNCTIONS ---
-run_worker_raw() {
-    local worker_name="$1" model="$2" system_prompt="$3" user_prompt="$4"
-    
-    local temperature="${AI_TEMPERATURE:-0.7}"
-    local top_p="${AI_TOP_P:-0.9}"
-    local seed="${AI_SEED:-}"
-    
-    local json_payload
-    json_payload=$(jq -n --arg system "$system_prompt" --arg prompt "$user_prompt" --argjson temp "$temperature" --argjson top_p "$top_p" \
-        '{
-            model: "\($model)",
-            prompt: $prompt,
-            system: $system,
-            options: {
-                temperature: $temp,
-                top_p: $top_p
-            },
-            stream: true
-        }' | sed "s/\"temperature\":$temperature/\"temperature\":$temperature/")
-    
-    if [[ -n "$seed" ]]; then
-        json_payload=$(echo "$json_payload" | jq --argjson seed "$seed" '.options.seed = $seed')
-    fi
-    
-    # Stream the response directly to terminal and capture it
-    local response_file
-    response_file=$(mktemp)
-    
-    {
-        curl -s -X POST http://localhost:11434/api/generate \
-            -H "Content-Type: application/json" \
-            -d "$json_payload" | tee /dev/tty | jq -r '.response? // empty'
-    } > "$response_file"
-    
-    local response
-    response=$(cat "$response_file")
-    rm "$response_file"
-    
-    echo "$response"
-}
+# --- WEBSOCKET DASHBOARD ---
+start_ws() {
+  WS_ACTIVE=1
+  rm -f "$AI_HOME/ws_fifo"
+  mkfifo "$AI_HOME/ws_fifo"
 
-run_worker_interactive() {
-    local worker_name="$1" model="$2" system_prompt="$3" user_prompt="$4" context_memories="$5" resonance_info="$6"
-    
-    local full_system_prompt="$system_prompt"
-    if [[ -n "$context_memories" ]]; then
-        full_system_prompt+="\n\nRELEVANT MEMORIES:\n$context_memories"
-    fi
-    if [[ -n "$resonance_info" ]]; then
-        full_system_prompt+="\n\nTASK RESONANCE: This task has been attempted $resonance_info times before. Learn from previous approaches."
-    fi
-    
-    log_worker_start "$worker_name" "$model"
-    local response
-    response=$(run_worker_raw "$worker_name" "$model" "$full_system_prompt" "$user_prompt")
-    log_worker_end
-    
-    echo "$response"
-}
-
-run_triumvirate_agent() {
-    local user_prompt="$1" semantic_hash="$2" instance_hash="$3" rehash_count="$4"
-    
-    local project_dir="$PROJECTS_DIR/$semantic_hash/$instance_hash"
-    mkdir -p "$project_dir"
-    set_config "current_project_root" "$project_dir"
-    
-    local event_log="$project_dir/events.jsonl"
-    local round=0
-    local final_response=""
-    
-    # Search for relevant memories
-    local context_memories
-    context_memories=$(search_memory "$user_prompt" 3 2>/dev/null || echo "")
-    local resonance_info="$rehash_count"
-    
-    while [[ $round -lt $MAX_TRIUMVIRATE_ROUNDS ]]; do
-        round=$((round + 1))
-        log_info "=== TRIUMVIRATE ROUND $round ==="
-        
-        # Messenger Phase - Understanding and Analysis
-        local messenger_prompt="You are the MESSENGER. Analyze the user request and break it down into core components.\n\nUSER REQUEST: $user_prompt\n\nAvailable tools: read_file, list_directory, web_search, read_web_page\n\nOutput format: THOUGHT: [your analysis]\\nACTION: [tool_name] [parameters] or FINAL: [summary]"
-        
-        local messenger_response
-        messenger_response=$(run_worker_interactive "Messenger" "$MESSENGER_MODEL" "$messenger_prompt" "$user_prompt" "$context_memories" "$resonance_info")
-        echo "{\"round\": $round, \"phase\": \"messenger\", \"response\": \"$messenger_response\"}" >> "$event_log"
-        
-        # Combinator Phase - Planning and Strategy
-        local combinator_prompt="You are the COMBINATOR. Create an execution plan based on Messenger's analysis.\n\nMESSENGER ANALYSIS: $messenger_response\n\nUSER REQUEST: $user_prompt\n\nAvailable tools: all tools (read, write, web, commands)\n\nOutput format: THOUGHT: [your plan]\\nACTION: [tool_sequence] or FINAL: [execution_plan]"
-        
-        local combinator_response
-        combinator_response=$(run_worker_interactive "Combinator" "$COMBINATOR_MODEL" "$combinator_prompt" "$user_prompt" "$context_memories" "$resonance_info")
-        echo "{\"round\": $round, \"phase\": \"combinator\", \"response\": \"$combinator_response\"}" >> "$event_log"
-        
-        # Trader Phase - Execution and Decision
-        local trader_prompt="You are the TRADER. Execute the plan and make final decisions.\n\nCOMBINATOR PLAN: $combinator_response\n\nORIGINAL REQUEST: $user_prompt\n\nAvailable tools: ALL tools (including write_file, run_command, delete_file - with user confirmation)\n\nOutput format: THOUGHT: [execution thoughts]\\nACTION: [tool_with_params] or FINAL: [complete_response]"
-        
-        local trader_response
-        trader_response=$(run_worker_interactive "Trader" "$TRADER_MODEL" "$trader_prompt" "$user_prompt" "$context_memories" "$resonance_info")
-        echo "{\"round\": $round, \"phase\": \"trader\", \"response\": \"$trader_response\"}" >> "$event_log"
-        
-        # Check if we have a final response
-        if echo "$trader_response" | grep -q "FINAL:"; then
-            final_response=$(echo "$trader_response" | grep "FINAL:" | sed 's/FINAL: //')
-            break
-        fi
-        
-        # Learn from this round for the next iteration
-        user_prompt="Continue execution based on previous round results. Messenger: $messenger_response, Combinator: $combinator_response, Trader: $trader_response"
-    done
-    
-    if [[ -z "$final_response" ]]; then
-        final_response="Maximum rounds reached. Final trader response: $trader_response"
-    fi
-    
-    # Store in memory
-    add_to_memory "$user_prompt" "$final_response" "$semantic_hash" "$instance_hash"
-    
-    log_success "=== TRIUMVIRATE COMPLETE ==="
-    echo "$final_response"
-}
-
-# --- API SERVER ---
-start_api_server() {
-    if [[ -f "$API_PID_FILE" ]] && kill -0 "$(cat "$API_PID_FILE")" 2>/dev/null; then
-        log_info "API server already running (PID: $(cat "$API_PID_FILE"))"
-        return 0
-    fi
-    
-    log_info "Starting API server on port $API_PORT..."
-    
-    # Create a simple HTTP server using netcat
-    while true; do
-        {
-            echo -e "HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\nConnection: close\\r\\n\\r"
-            echo '{"status": "ready", "version": "v8.1", "timestamp": "'$(date -Iseconds)'"}'
-        } | nc -l -p "$API_PORT" -q 1 | handle_api_request &
-        echo $! > "$API_PID_FILE"
-    done &
-    
-    local api_pid=$!
-    echo $api_pid > "$API_PID_FILE"
-    log_success "API server started (PID: $api_pid)"
-}
-
-stop_api_server() {
-    if [[ -f "$API_PID_FILE" ]]; then
-        local pid
-        pid=$(cat "$API_PID_FILE")
-        if kill -0 "$pid" 2>/dev/null; then
-            kill "$pid"
-            rm -f "$API_PID_FILE"
-            log_success "API server stopped"
-        else
-            log_warn "API server not running"
-            rm -f "$API_PID_FILE"
-        fi
-    else
-        log_warn "No API server PID file found"
-    fi
-}
-
-api_status() {
-    if [[ -f "$API_PID_FILE" ]] && kill -0 "$(cat "$API_PID_FILE")" 2>/dev/null; then
-        log_success "API server is running (PID: $(cat "$API_PID_FILE"))"
-        return 0
-    else
-        log_warn "API server is not running"
-        return 1
-    fi
-}
-
-handle_api_request() {
-    read -r request
-    local endpoint
-    endpoint=$(echo "$request" | awk '{print $2}')
-    local method
-    method=$(echo "$request" | awk '{print $1}')
-    
-    # Log the request
-    sqlite3 "$API_LOGS_DB" "INSERT INTO api_logs (endpoint, method, payload) VALUES ('$endpoint', '$method', '$(sqlite_escape "$request")');" 2>/dev/null
-    
-    case "$endpoint" in
-        "/status")
-            echo -e "HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\n\\r"
-            echo '{"status": "ready", "version": "v8.1"}'
-            ;;
-        "/prompt")
-            if [[ "$method" == "POST" ]]; then
-                # Read the POST data
-                while IFS= read -r line; do
-                    [[ "$line" == "" ]] && break
-                done
-                read -r payload
-                
-                local prompt
-                prompt=$(echo "$payload" | jq -r '.prompt' 2>/dev/null || echo "")
-                if [[ -n "$prompt" ]]; then
-                    log_info "API received prompt: $prompt"
-                    # Process the prompt (this would need to be async in a real implementation)
-                    echo -e "HTTP/1.1 200 OK\\r\\nContent-Type: application/json\\r\\n\\r"
-                    echo '{"status": "processing", "prompt": "'"$prompt"'"}'
-                else
-                    echo -e "HTTP/1.1 400 Bad Request\\r\\nContent-Type: application/json\\r\\n\\r"
-                    echo '{"error": "Missing prompt"}'
-                fi
-            else
-                echo -e "HTTP/1.1 405 Method Not Allowed\\r\\nContent-Type: application/json\\r\\n\\r"
-                echo '{"error": "Method not allowed"}'
-            fi
-            ;;
-        *)
-            echo -e "HTTP/1.1 404 Not Found\\r\\nContent-Type: application/json\\r\\n\\r"
-            echo '{"error": "Endpoint not found"}'
-            ;;
-    esac
-}
-
-# --- DEPENDENCY CHECK ---
-check_dependencies() {
-    local missing=()
-    
-    # Required dependencies
-    for cmd in sqlite3 jq curl; do
-        if ! command -v "$cmd" &> /dev/null; then
-            missing+=("$cmd")
-        fi
-    done
-    
-    # Ollama check
-    if ! command -v ollama &> /dev/null; then
-        log_warn "Ollama not found. Install from https://ollama.ai"
-        missing+=("ollama")
-    else
-        if ! ollama list | grep -q "$MESSENGER_MODEL"; then
-            log_warn "Model $MESSENGER_MODEL not found. Run: ollama pull $MESSENGER_MODEL"
-        fi
-        if ! ollama list | grep -q "$COMBINATOR_MODEL"; then
-            log_warn "Model $COMBINATOR_MODEL not found. Run: ollama pull $COMBINATOR_MODEL"
-        fi
-        if ! ollama list | grep -q "$TRADER_MODEL"; then
-            log_warn "Model $TRADER_MODEL not found. Run: ollama pull $TRADER_MODEL"
-        fi
-    fi
-    
-    # Optional but recommended
-    for cmd in nc tree wget; do
-        if ! command -v "$cmd" &> /dev/null; then
-            log_warn "Optional tool $cmd not installed. Some features may be limited."
-        fi
-    done
-    
-    if [[ ${#missing[@]} -gt 0 ]]; then
-        log_error "Missing dependencies: ${missing[*]}"
-        return 1
-    fi
-    
-    log_success "All dependencies satisfied"
-    return 0
-}
-
-setup_environment() {
-    log_info "Setting up AI Agent environment..."
-    init_db
-    
-    # Set default config if not exists
-    if [[ -z "$(get_config messenger_model)" ]]; then set_config messenger_model "$MESSENGER_MODEL"; fi
-    if [[ -z "$(get_config combinator_model)" ]]; then set_config combinator_model "$COMBINATOR_MODEL"; fi
-    if [[ -z "$(get_config trader_model)" ]]; then set_config trader_model "$TRADER_MODEL"; fi
-    if [[ -z "$(get_config temperature)" ]]; then set_config temperature "0.7"; fi
-    if [[ -z "$(get_config top_p)" ]]; then set_config top_p "0.9"; fi
-    if [[ -z "$(get_config api_port)" ]]; then set_config api_port "$API_PORT"; fi
-    
-    load_config_values
-    log_success "Environment setup complete"
-}
-
-# --- MAIN FUNCTION ---
-main() {
-    init_db
-    load_config_values
-    
-    case "${1:-}" in
-        "--setup")
-            check_dependencies
-            setup_environment
-            ;;
-        "--config")
-            case "${2:-}" in
-                "set")
-                    set_config "$3" "$4"
-                    ;;
-                "get")
-                    get_config "$3"
-                    ;;
-                "view")
-                    view_config
-                    ;;
-                *)
-                    echo "Usage: $0 --config [set|get|view] [key] [value]"
-                    ;;
-            esac
-            ;;
-        "--hash")
-            case "${2:-}" in
-                "record")
-                    record_hash "$3" "$4" "$5"
-                    ;;
-                "get")
-                    get_hash "$3" "$4"
-                    ;;
-                "view")
-                    view_hash_index
-                    ;;
-                *)
-                    echo "Usage: $0 --hash [record|get|view] [type] [target] [hash]"
-                    ;;
-            esac
-            ;;
-        "--memory")
-            case "${2:-}" in
-                "search")
-                    search_memory "$3" "${4:-5}"
-                    ;;
-                "clear")
-                    clear_memory
-                    ;;
-                *)
-                    echo "Usage: $0 --memory [search|clear] [query] [limit]"
-                    ;;
-            esac
-            ;;
-        "--api")
-            case "${2:-}" in
-                "start")
-                    start_api_server
-                    ;;
-                "stop")
-                    stop_api_server
-                    ;;
-                "status")
-                    api_status
-                    ;;
-                *)
-                    echo "Usage: $0 --api [start|stop|status]"
-                    ;;
-            esac
-            ;;
-        "--tools")
-            echo "Available tools:"
-            echo "  read_file, list_directory, web_search, read_web_page"
-            echo "  write_file, create_directory, copy_file, move_file, delete_file"
-            echo "  make_web_request, check_port, download_file, run_command"
-            ;;
-        "--help")
-            cat << EOF
-AI Agent v8.1 - Adaptive Triumvirate Mind Edition
-
-Usage: $0 [OPTIONS] [PROMPT]
-
-OPTIONS:
-  --setup                    Setup environment and check dependencies
-  --config set|get|view      Manage configuration
-  --hash record|get|view     Manage content hashing
-  --memory search|clear      Manage memory system
-  --api start|stop|status    Control API server
-  --tools                    List available tools
-  --help                     Show this help
-  --seed [value]             Set random seed for AI generation
-
-EXAMPLES:
-  $0 --setup
-  $0 "Write a Python script to sort numbers"
-  $0 --config set temperature 0.8
-  $0 --memory search "python script"
-  $0 --api start
-
-ARCHITECTURE:
-  Three specialized AI workers:
-  - Messenger ($MESSENGER_MODEL): Analysis and understanding
-  - Combinator ($COMBINATOR_MODEL): Planning and strategy  
-  - Trader ($TRADER_MODEL): Execution and decisions
-
+  # HTML dashboard served by websocketd
+  DASHBOARD_HTML="$AI_HOME/index.html"
+  cat > "$DASHBOARD_HTML" << 'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Dex AI Dashboard</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/highlight.js@11.8.0/styles/monokai-sublime.min.css">
+<script src="https://cdn.jsdelivr.net/npm/highlight.js@11.8.0/lib/highlight.js"></script>
+<script>
+document.addEventListener("DOMContentLoaded", function() {
+  const logDiv = document.getElementById("log");
+  const evtSource = new EventSource("/ws");
+  evtSource.onmessage = function(e) {
+    const pre = document.createElement("pre");
+    pre.innerHTML = e.data.replace(/</g,"&lt;").replace(/>/g,"&gt;");
+    pre.className = "hljs javascript";
+    hljs.highlightElement(pre);
+    logDiv.appendChild(pre);
+    logDiv.scrollTop = logDiv.scrollHeight;
+  };
+});
+</script>
+<style>
+body { background:#272822; color:#f8f8f2; font-family: monospace; padding: 10px; }
+pre.hljs { background:#272822; padding:8px; border-radius:5px; }
+#log { height:90vh; overflow-y:auto; }
+</style>
+</head>
+<body>
+<h2>Dex AI Dashboard - Monokai Dark</h2>
+<div id="log"></div>
+</body>
+</html>
 EOF
-            ;;
-        "--seed")
-            AI_SEED="$2"
-            set_config seed "$AI_SEED"
-            log_success "Seed set to: $AI_SEED"
-            shift 2
-            main "$@"
-            ;;
-        *)
-            if [[ $# -eq 0 ]]; then
-                echo "Enter your prompt (Ctrl+D to finish):"
-                local prompt
-                prompt=$(cat)
-                if [[ -z "$prompt" ]]; then
-                    log_error "No prompt provided"
-                fi
-            else
-                local prompt="$*"
-            fi
-            
-            check_dependencies
-            
-            log_info "Processing prompt: $prompt"
-            
-            # Setup task pool and get hashes
-            local pool_info
-            pool_info=$(setup_task_pool "$prompt")
-            local semantic_hash instance_hash rehash_count
-            semantic_hash=$(echo "$pool_info" | cut -d' ' -f1)
-            instance_hash=$(echo "$pool_info" | cut -d' ' -f2)
-            rehash_count=$(echo "$pool_info" | cut -d' ' -f3)
-            
-            log_info "Task pool: semantic=$semantic_hash, instance=$instance_hash, resonance=$rehash_count"
-            
-            # Run the triumvirate agent
-            run_triumvirate_agent "$prompt" "$semantic_hash" "$instance_hash" "$rehash_count"
-            ;;
-    esac
+
+  log "Starting websocketd server on port $WS_PORT"
+  websocketd --port="$WS_PORT" --devconsole --staticdir="$AI_HOME" cat "$AI_HOME/ws_fifo" &
+  log_success "Open browser: http://localhost:$WS_PORT"
 }
 
-# --- TRAP FOR CLEANUP ---
-trap 'log_warn "Script interrupted"; exit 1' INT TERM
+# --- MAIN ---
+init_db
 
-# --- ENTRY POINT ---
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    main "$@"
+if [[ $# -eq 0 ]]; then
+  log_error "CLI mandatory. Usage: dex \"task description\" or dex serve-ws"
 fi
+
+case "$1" in
+  serve-ws)
+    start_ws
+    ;;
+  --setup)
+    log "Installing dependencies..."
+    sudo apt update && sudo apt install -y sqlite3 jq curl tree lynx
+    log_success "Setup complete."
+    ;;
+  *)
+    run_triumvirate "$*"
+    ;;
+esac
