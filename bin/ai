@@ -10,14 +10,14 @@ AI_HOME="${AI_HOME:-$HOME/.ai_agent}"
 PROJECTS_DIR="${PROJECTS_DIR:-$HOME/ai_projects}"
 
 # --- Models (can be overridden via --config) ---
-DEFAULT_AGENT_MODEL="llama3.1:8b"
-DEFAULT_CODEWRITER_MODEL="codellama:7b"
-DEFAULT_VALIDATOR_MODEL="2244-1"
+DEFAULT_AGENT_MODEL="core"
+DEFAULT_CODEWRITER_MODEL="loop"
+DEFAULT_VALIDATOR_MODEL="code"
 
 # Will be loaded from config
-AGENT_MODEL=""
-CODEWRITER_MODEL=""
-VALIDATOR_MODEL=""
+AGENT_MODEL="core"
+CODEWRITER_MODEL="loop"
+VALIDATOR_MODEL="code"
 
 OLLAMA_BIN="$(command -v ollama || true)"
 MEMORY_DB="$AI_HOME/memory.db"

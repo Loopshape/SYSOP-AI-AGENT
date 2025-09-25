@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // Triumvirate JSON SSE Server - Modern URL API Edition
-const http = require('http');
-const { spawn } = require('child_process');
-const path = require('path');
-const fs = require('fs');
+const http = import('http');
+const { spawn } = import('child_process');
+const path = import('path');
+const fs = import('fs');
 
 // Remove deprecated url.parse and use WHATWG URL API
 class TriumvirateServer {
