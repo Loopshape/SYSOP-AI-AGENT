@@ -1,0 +1,77 @@
+#!/usr/bin/env bash
+
+# ai - Main Dispatcher for the SYSOP-AI-AGENT Platform
+# Version 10.0 - The Sysop Integration Edition
+
+# --- Project Root & Source Loading ---
+# Find the script's own directory, so it can be run from anywhere
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &> /dev/null && pwd)
+PROJECT_ROOT=$(dirname "$SCRIPT_DIR")
+
+# Source all the necessary modules
+source "$PROJECT_ROOT/src/utils.sh"
+source "$PROJECT_ROOT/src/config.sh"
+source "$PROJECT_ROOT/src/tools.sh"
+source "$PROJECT_ROOT/src/core.sh"
+
+# --- MAIN DISPATCHER ---
+main() {
+    # On first run, or if config is missing, offer to run setup
+    if [[ ! -f "$CONFIG_FILE" ]]; then
+        log_warn "Configuration file not found. It's recommended to run the installer first."
+        log_info "Run: bash $PROJECT_ROOT/install.sh"
+    fi
+    
+    # Load all configuration values into shell variables
+    load_config_values
+    
+    # Ensure core databases exist
+    init_db
+    
+    if [[ $# -eq 0 ]]; then
+        show_help
+        exit 0
+    fi
+
+    # Handle top-level commands
+    case "$1" in
+        --setup)
+            bash "$PROJECT_ROOT/install.sh"
+            ;;
+        --help|-h)
+            show_help
+            ;;
+        # --- Direct Action Modes ---
+        git)
+            shift
+            git_operation "${1:-status}" "${2:-.}"
+            ;;
+        memory)
+            shift
+            memory_operation "${1:-search}" "${*:-}"
+            ;;
+        config)
+            shift
+            config_operation "${1:-view}" "${2:-}" "${3:-}"
+            ;;
+        # --- Agent Modes ---
+        agent)
+            shift
+            run_coder_agi_agent "$@"
+            ;;
+        triumvirate)
+            shift
+            run_triumvirate_agent "$@"
+            ;;
+        *)
+            # Default to the primary Coder-AGI agent for any other prompt
+            run_coder_agi_agent "$@"
+            ;;
+    esac
+}
+
+# --- ENTRY POINT ---
+# Run if the script is executed directly
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
