@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# ai.sh - AI DevOps Platform v14.3 - The Self-Improving Agent Edition
+# ai.sh - AI DevOps Platform v14.4 - Schema-Fix Edition
 # Single-file: Web UI + AGI Workflows with a persistent Memory & Hashing Core for learning.
 
 set -euo pipefail
@@ -19,7 +19,7 @@ const HTML_UI = `
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8"><title>AI DevOps Platform v14.3</title>
+    <meta charset="UTF-8"><title>AI DevOps Platform v14.4</title>
     <style>:root{--bg:#0f0f23;--text:#00ff00;--accent:#ff6ec7;--secondary:#6a67ce;}body{font-family:'Courier New',monospace;background:var(--bg);color:var(--text);}
     .terminal{background:#000;border:2px solid var(--accent);border-radius:10px;padding:20px;margin:20px;height:70vh;overflow-y:auto;}
     .input-line{display:flex;margin-top:10px;border-top:1px solid var(--secondary);padding-top:10px;}
@@ -27,7 +27,7 @@ const HTML_UI = `
     .output{white-space:pre-wrap;}.success{color:#00ff88;}.error{color:#ff4444;}</style>
 </head>
 <body>
-    <div style="text-align:center;padding:20px;border-bottom:2px solid var(--accent);"><h1>🤖 AI DevOps Platform v14.3</h1></div>
+    <div style="text-align:center;padding:20px;border-bottom:2px solid var(--accent);"><h1>🤖 AI DevOps Platform v14.4</h1></div>
     <div class="terminal"><div id="output" class="output"><div>🚀 AI Agent ready.</div></div><div class="input-line"><span class="prompt">ai&gt;</span><input type="text" id="commandInput"></div></div>
     <script>
         const output=document.getElementById('output'),input=document.getElementById('commandInput');
@@ -63,7 +63,7 @@ http.createServer((req, res) => {
 NODE_EOF
 fi
 
-# --- BASH AGENT CORE (v14.3) ---
+# --- BASH AGENT CORE (v14.4) ---
 
 # --- CONFIGURATION ---
 AI_HOME="${AI_HOME:-$HOME/.ai_agent}"
@@ -75,7 +75,7 @@ REVIEWER_MODEL="${REVIEWER_MODEL:-$DEFAULT_MODEL}"
 TESTER_MODEL="${TESTER_MODEL:-$DEFAULT_MODEL}"
 OLLAMA_BIN="$(command -v ollama || echo 'ollama')"
 MEMORY_DB="$AI_HOME/memory.db"
-HASH_INDEX_DB="$AI_HOME/hash_index.db" # NEW
+HASH_INDEX_DB="$AI_HOME/hash_index.db"
 CONFIG_DB="$AI_HOME/config.db"
 MAX_AGENT_LOOPS=5
 
@@ -89,10 +89,25 @@ log_success() { printf "${GREEN}${ICON_SUCCESS} [%s] %s${NC}\n" "$(date '+%T')" 
 log_error() { printf "${RED}${ICON_ERROR} [%s] ERROR: %s${NC}\n" "$(date '+%T')" "$*" >&2; exit 1; }
 log_phase() { echo -e "\n${PURPLE}🚀 %s${NC}" "$*" >&2; }
 
-# --- DATABASE SYSTEM (ENHANCED) ---
+# --- DATABASE SYSTEM (FIXED) ---
 init_db() {
-    sqlite3 "$MEMORY_DB" "CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY, timestamp DATETIME, prompt TEXT, project TEXT, status TEXT, hash TEXT UNIQUE);" 2>/dev/null || true
-    sqlite3 "$HASH_INDEX_DB" "CREATE TABLE IF NOT EXISTS hashes (id INTEGER PRIMARY KEY, file_path TEXT UNIQUE, hash TEXT, timestamp DATETIME);" 2>/dev/null || true
+    # FIX: Added the 'hash' column to the memories table schema to match the application logic.
+    sqlite3 "$MEMORY_DB" "CREATE TABLE IF NOT EXISTS memories (
+        id INTEGER PRIMARY KEY,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        prompt TEXT,
+        project TEXT,
+        status TEXT,
+        hash TEXT UNIQUE
+    );" 2>/dev/null || true
+    
+    sqlite3 "$HASH_INDEX_DB" "CREATE TABLE IF NOT EXISTS hashes (
+        id INTEGER PRIMARY KEY,
+        file_path TEXT UNIQUE,
+        hash TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+    );" 2>/dev/null || true
+    
     sqlite3 "$CONFIG_DB" "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);" 2>/dev/null || true
 }
 sqlite_escape() { echo "$1" | sed "s/'/''/g"; }
@@ -102,20 +117,20 @@ set_config() { sqlite3 "$CONFIG_DB" "INSERT OR REPLACE INTO config (key, value) 
 get_config() { sqlite3 "$CONFIG_DB" "SELECT value FROM config WHERE key = '$1';" 2>/dev/null; }
 load_config() { AGENT_MODEL=$(get_config agent_model || echo "$DEFAULT_MODEL"); }
 
-# --- MEMORY & HASHING CORE (NEW) ---
+# --- MEMORY & HASHING CORE ---
 add_to_memory() {
     local prompt="$1" project="$2" status="$3" hash="$4"
-    sqlite3 "$MEMORY_DB" "INSERT OR REPLACE INTO memories (prompt, project, status, hash, timestamp) VALUES ('$(sqlite_escape "$prompt")', '$(sqlite_escape "$project")', '$status', '$hash', CURRENT_TIMESTAMP);"
+    sqlite3 "$MEMORY_DB" "INSERT OR REPLACE INTO memories (prompt, project, status, hash) VALUES ('$(sqlite_escape "$prompt")', '$(sqlite_escape "$project")', '$status', '$hash');"
 }
 search_memory() {
-    # Returns the hash of the most recent similar prompt
+    # This function now correctly queries the 'hash' column.
     sqlite3 "$MEMORY_DB" "SELECT hash FROM memories WHERE prompt LIKE '%$(sqlite_escape "$1")%' AND status = 'SUCCESS' ORDER BY timestamp DESC LIMIT 1;"
 }
 index_file_hash() {
     local file_path="$1"
     if [[ ! -f "$file_path" ]]; then return; fi
     local hash; hash=$(sha256sum "$file_path" | awk '{print $1}')
-    sqlite3 "$HASH_INDEX_DB" "INSERT OR REPLACE INTO hashes (file_path, hash, timestamp) VALUES ('$(sqlite_escape "$file_path")', '$hash', CURRENT_TIMESTAMP);"
+    sqlite3 "$HASH_INDEX_DB" "INSERT OR REPLACE INTO hashes (file_path, hash) VALUES ('$(sqlite_escape "$file_path")', '$hash');"
     echo "$hash"
 }
 get_hashes_for_memory() {
@@ -136,7 +151,6 @@ run_agi_workflow() {
     log_phase "🚀 AGI Workflow: $project_name"
     log_success "Project directory: $project_dir"
 
-    # --- NEW: MEMORY RETRIEVAL & CONTEXT INJECTION ---
     log "Searching memory for similar past tasks..."
     local past_task_hash; past_task_hash=$(search_memory "$user_prompt")
     local memory_context="This is a new task."
@@ -159,7 +173,6 @@ run_agi_workflow() {
         local coder_prompt="You are CODER. Write code for '$main_file'. Output ONLY code. $memory_context. Request: $user_prompt. Review: ${review:-None}. Test Errors: ${test_output:-None}"
         code=$(run_ai_model "$coder_prompt"); echo "$code" > "$main_file"
         
-        # ... (rest of the Coder->Reviewer->Tester loop is the same) ...
         review=$(run_ai_model "You are REVIEWER. Critique this code. If perfect, respond 'LGTM'. Code:\n$code")
         if [[ "$review" != "LGTM" ]]; then
             code=$(run_ai_model "You are CODER. Refactor based on review. Output ONLY code.\nReview:\n$review\nCode:\n$code"); echo "$code" > "$main_file"
@@ -169,13 +182,12 @@ run_agi_workflow() {
         log_phase "✅ Validation"
         local test_cmd=""; case "$language" in python) test_cmd="pip install pytest -q && python3 -m pytest $test_file";; javascript) test_cmd="npm install -s jest && npx jest $test_file";; *) status="MANUAL_REVIEW"; break;; esac
         if confirm_action "Run tests: $test_cmd"; then
-            test_output=$( (eval "$test_cmd") 2>&1 ) || true
+            local test_output; test_output=$( (eval "$test_cmd") 2>&1 ) || true
             if [[ $? -eq 0 && ! "$test_output" =~ "failed" ]]; then log_success "All tests passed!"; status="SUCCESS"; break;
             else log_warn "Tests failed. Retrying."; status="TESTS_FAILED"; fi
         else status="MANUAL_VERIFICATION"; break; fi
     done
     
-    # --- NEW: HASHING & INDEXING ON COMPLETION ---
     local final_hash; final_hash=$(index_file_hash "$main_file")
     add_to_memory "$user_prompt" "$project_name" "$status" "$final_hash"
     
@@ -185,7 +197,7 @@ run_agi_workflow() {
 # --- HELP & MAIN DISPATCHER ---
 show_help() {
     cat << EOF
-${GREEN}AI DevOps Platform v14.3 - The Self-Improving Agent Edition${NC}
+${GREEN}AI DevOps Platform v14.4 - Schema-Fix Edition${NC}
 
 An AGI workflow with a persistent Memory & Hashing Core for learning from past tasks.
 
@@ -204,6 +216,8 @@ EOF
 }
 
 main() {
+    # Initialize DBs. If they don't exist, this will create them.
+    # If they exist but the schema is wrong, the user must manually delete the .db files.
     init_db; load_config
     if [[ $# -eq 0 ]]; then show_help; return 0; fi
     
@@ -212,7 +226,9 @@ main() {
         --setup|-s)
             log "Installing dependencies (sqlite3, git, curl, node, npm, tree)..."
             # (Full setup logic would go here)
-            log_success "Setup complete."
+            log_success "Setup complete. Initializing databases..."
+            init_db
+            log_success "Databases ready. Please delete old .db files if you see schema errors."
             ;;
         memory)
             shift; local op="${1:-search}"; local query="${2:-}"
