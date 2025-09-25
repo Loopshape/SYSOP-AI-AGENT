@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+dex - Single-file SYSOP-AI-AGENT CLI
+Features:
+- AGI multi-file loops with Ollama streaming
+- Planner with action queue
+- File/path-processing tools
+- Config & memory management
+- Git integration
+- Colored headers
+"""
+
+import os, sys, subprocess, sqlite3, shutil
+from pathlib import Path
+from collections import deque
+
+# --- ANSI Colors ---
+RED = '\033[0;31m'; GREEN = '\033[0;32m'; YELLOW = '\033[1;33m'; BLUE = '\033[0;34m'
+PURPLE = '\033[0;35m'; CYAN = '\033[0;36m'; NC = '\033[0m'
+def color_text(text, color): return f"{color}{text}{NC}"
+
+# -------------------------------
+# FILE & PATH TOOLS
+# -------------------------------
+def list_files(directory, recursive=True, extensions=None):
+    p = Path(directory)
+    if not p.is_dir(): return []
+    files = []
+    iterator = p.rglob("*") if recursive else p.iterdir()
+    for f in iterator:
+        if f.is_file() and (not extensions or f.suffix in extensions):
+            files.append(str(f))
+    return files
+
+def read_file(path):
+    p = Path(path)
+    if not p.is_file(): return ""
+    return p.read_text(encoding="utf-8")
+
+def write_file(path, content):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+
+def copy_file(src, dst):
+    Path(dst).parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+
+def move_file(src, dst):
+    Path(dst).parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(src, dst)
+
+def remove_file(path):
+    p = Path(path)
+    if p.exists() and p.is_file(): p.unlink()
+
+def find_files_containing(directory, text, recursive=True, extensions=None):
+    matched = []
+    for f in list_files(directory, recursive, extensions):
+        try:
+            if text in read_file(f): matched.append(f)
+        except: pass
+    return matched
+
+# -------------------------------
+# MEMORY MANAGEMENT
+# -------------------------------
+AI_HOME = os.getenv("AI_HOME", os.path.expanduser("~/.ai_agent"))
+MEMORY_DB = os.path.join(AI_HOME, "memory.db")
+os.makedirs(AI_HOME, exist_ok=True)
+def init_memory():
+    conn = sqlite3.connect(MEMORY_DB)
+    conn.execute("""CREATE TABLE IF NOT EXISTS memories (
+        id INTEGER PRIMARY KEY, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        prompt TEXT, project TEXT, code TEXT, review TEXT, tests TEXT, status TEXT)""")
+    conn.commit(); conn.close()
+init_memory()
+
+def add_memory(prompt, project, code="", review="", tests="", status=""):
+    conn = sqlite3.connect(MEMORY_DB)
+    conn.execute("INSERT INTO memories (prompt, project, code, review, tests, status) VALUES (?,?,?,?,?,?)",
+                 (prompt, project, code, review, tests, status))
+    conn.commit(); conn.close()
+
+def search_memory(term):
+    conn = sqlite3.connect(MEMORY_DB)
+    cur = conn.cursor()
+    cur.execute("SELECT timestamp,prompt,project,status FROM memories WHERE prompt LIKE ? ORDER BY timestamp DESC LIMIT 5", (f"%{term}%",))
+    rows = cur.fetchall(); conn.close()
+    return rows
+
+# -------------------------------
+# CONFIG MANAGEMENT
+# -------------------------------
+CONFIG_DB = os.path.join(AI_HOME, "config.db")
+def init_config():
+    conn = sqlite3.connect(CONFIG_DB)
+    conn.execute("CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT)")
+    conn.commit(); conn.close()
+init_config()
+
+def set_config(k,v):
+    conn = sqlite3.connect(CONFIG_DB)
+    conn.execute("INSERT OR REPLACE INTO config (key,value) VALUES (?,?)",(k,v))
+    conn.commit(); conn.close()
+
+def get_config(k, default=None):
+    conn = sqlite3.connect(CONFIG_DB)
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM config WHERE key=?",(k,))
+    r = cur.fetchone(); conn.close()
+    return r[0] if r else default
+
+# -------------------------------
+# OLLAMA CLIENT (STREAMING)
+# -------------------------------
+OLLAMA_BIN = os.getenv("OLLAMA_BIN","ollama")
+def ollama_stream(prompt, model):
+    if not shutil.which(OLLAMA_BIN):
+        print(color_text("[ERROR] Ollama CLI not found", RED)); return ""
+    if not subprocess.run([OLLAMA_BIN,"list"],capture_output=True,text=True).returncode==0:
+        subprocess.run([OLLAMA_BIN,"pull",model])
+    full_output = []
+    with subprocess.Popen([OLLAMA_BIN,"run",model,prompt], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as proc:
+        for line in proc.stdout:
+            print(color_text(line.strip(), GREEN))
+            full_output.append(line)
+        proc.wait()
+    return "".join(full_output).strip()
+
+# -------------------------------
+# PLANNER + ACTION QUEUE
+# -------------------------------
+class AGIPlanner:
+    def __init__(self, project_dir):
+        self.project_dir = project_dir
+        self.backup_dir = os.path.join(project_dir,".backup")
+        os.makedirs(self.backup_dir,exist_ok=True)
+        self.queue = deque()
+    def add_action(self, action_type, target_file=None, extra=None, priority=1):
+        self.queue.append({"type":action_type,"file":target_file,"extra":extra,"priority":priority})
+    def get_next(self):
+        if not self.queue: return None
+        self.queue = deque(sorted(self.queue,key=lambda x:-x["priority"]))
+        return self.queue.popleft()
+    def backup_file(self, filename):
+        src = os.path.join(self.project_dir, filename)
+        dst = os.path.join(self.backup_dir, f"{filename}.bak")
+        copy_file(src,dst)
+        print(color_text(f"[Planner] Backup created: {dst}", CYAN))
+    def list_files(self,extensions=None): return list_files(self.project_dir,extensions=extensions)
+    def read_file(self,f): return read_file(os.path.join(self.project_dir,f))
+    def write_file(self,f,content): write_file(os.path.join(self.project_dir,f),content)
+
+# -------------------------------
+# AGI LOOP
+# -------------------------------
+MAX_AGENT_LOOPS = 5
+AGENT_MODEL = get_config("agent_model","llama3.1:8b")
+REVIEWER_MODEL = get_config("reviewer_model","2244-1")
+TESTER_MODEL = get_config("tester_model","deepseek-coder:6.7b-instruct")
+
+def agi_loop_header(loop,max_loops,status,role=None):
+    role_color = {"CODER":GREEN,"REVIEWER":YELLOW,"REFINER":BLUE,"TESTER":CYAN,"VERIFICATION":PURPLE}.get(role,NC)
+    header = f"\n{'='*60}\n[AGI Loop {loop}/{max_loops}] Status: {color_text(status,YELLOW)}"
+    if role: header += f" | Current role: {color_text(role,role_color)}"
+    header += f"\n{'='*60}"; print(header)
+
+def run_tests(language,test_file,project_dir):
+    # Simplified: returns success always (replace with real test execution)
+    return "SUCCESS",""
+
+def run_coder_agi(prompt):
+    project_name = "".join(c if c.isalnum() else "-" for c in prompt)[:32]
+    project_dir = os.path.join(os.path.expanduser("~/ai_projects"),project_name)
+    os.makedirs(project_dir,exist_ok=True)
+    planner = AGIPlanner(project_dir)
+    main_file = f"main.py"  # simplified for Python only
+
+    # Setup initial actions
+    planner.add_action("create_main",main_file,priority=10)
+
+    status = "IN_PROGRESS"
+    for loop in range(1,MAX_AGENT_LOOPS+1):
+        agi_loop_header(loop,MAX_AGENT_LOOPS,status)
+        while True:
+            action = planner.get_next()
+            if not action: break
+            f = action.get("file")
+            role_label = f"{action['type'].upper()} {f}" if f else action['type'].upper()
+            agi_loop_header(loop,MAX_AGENT_LOOPS,status,role=role_label)
+
+            if action["type"]=="create_main":
+                code = ollama_stream(f"Create main file for: {prompt}",AGENT_MODEL)
+                planner.write_file(f,code)
+                planner.add_action("review",f,priority=5)
+            elif action["type"]=="review":
+                content = planner.read_file(f)
+                feedback = ollama_stream(f"Review file:\n{content}",REVIEWER_MODEL)
+                if feedback.strip()!="LGTM": planner.add_action("refactor",f,extra={"feedback":feedback},priority=8)
+            elif action["type"]=="refactor":
+                content = planner.read_file(f)
+                feedback = action["extra"]["feedback"]
+                updated = ollama_stream(f"Refactor code based on feedback:\n{feedback}\nCode:\n{content}",AGENT_MODEL)
+                planner.write_file(f,updated)
+            elif action["type"]=="backup":
+                planner.backup_file(f)
+            elif action["type"]=="test":
+                status,_ = run_tests("python",f,project_dir)
+        if status=="SUCCESS": break
+
+    add_memory(prompt,project_name,status=status)
+    print(color_text(f"[AGI Finished] Status: {status}. Project: {project_dir}",GREEN if status=="SUCCESS" else YELLOW))
+
+# -------------------------------
+# CLI DISPATCHER
+# -------------------------------
+def print_help():
+    print(color_text("DEX CLI - SYSOP-AI-AGENT",GREEN))
+    print(f"Usage:\n  {color_text('dex <prompt>',CYAN)} Run AGI\n  {color_text('dex memory search <term>',CYAN)} Memory search\n  {color_text('dex file list <dir>',CYAN)} File list\n  {color_text('dex git <status|pull|push> <path>',CYAN)} Git ops\n  {color_text('dex --help',CYAN)} Show help")
+
+def main():
+    if len(sys.argv)<2 or sys.argv[1] in ("--help","-h"):
+        print_help(); return
+    cmd = sys.argv[1]
+    if cmd=="memory":
+        sub = sys.argv[2] if len(sys.argv)>2 else "search"; term = sys.argv[3] if len(sys.argv)>3 else ""
+        rows = search_memory(term); [print(row) for row in rows]
+    elif cmd=="file":
+        action = sys.argv[2] if len(sys.argv)>2 else "list"
+        path = sys.argv[3] if len(sys.argv)>3 else os.getcwd()
+        files = list_files(path); [print(f) for f in files]
+    elif cmd=="git":
+        op = sys.argv[2] if len(sys.argv)>2 else "status"; path = sys.argv[3] if len(sys.argv)>3 else os.getcwd()
+        subprocess.run(["git",op],cwd=path)
+    else:
+        prompt = " ".join(sys.argv[1:]); run_coder_agi(prompt)
+
+if __name__=="__
