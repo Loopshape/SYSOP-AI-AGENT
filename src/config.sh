@@ -1,16 +1,13 @@
 #!/usr/bin/env bash
 
-# --- CONFIG & DB PATHS ---
-AI_HOME="${AI_HOME:-$HOME/.ai_agent}"
-PROJECTS_DIR="${PROJECTS_DIR:-$HOME/ai_projects}"
+# --- CONFIG & DB PATHS (Now relative to PROJECT_ROOT) ---
 CONFIG_DIR="$PROJECT_ROOT/config"
 CONFIG_FILE="$CONFIG_DIR/config.json"
 DATA_DIR="$PROJECT_ROOT/data"
 MEMORY_DB="$DATA_DIR/memory.db"
+PROJECTS_DIR="${PROJECTS_DIR:-$HOME/ai_projects}" # User projects can still be in HOME
 SSH_DIR="$HOME/.ssh"
 GIT_SSH_KEY="$SSH_DIR/id_ai_agent"
-OLLAMA_BIN="${OLLAMA_BIN:-$(command -v ollama || true)}"
-MAX_AGENT_LOOPS=5
 
 # --- Config & DB Variables ---
 AGENT_MODEL=""
@@ -20,7 +17,7 @@ TESTER_MODEL=""
 MESSENGER_MODEL=""
 COMBINATOR_MODEL=""
 TRADER_MODEL=""
-
+OLLAMA_BIN=""
 
 # --- DATABASE & CONFIG ---
 init_db() {
@@ -39,6 +36,8 @@ load_config_values() {
     COMBINATOR_MODEL=$(jq -r '.models.combinator' "$CONFIG_FILE")
     TRADER_MODEL=$(jq -r '.models.trader' "$CONFIG_FILE")
     OLLAMA_BIN=$(jq -r '.ollama_bin' "$CONFIG_FILE")
+    # Return 0 on success
+    return 0
 }
 
 config_operation() {
@@ -48,7 +47,8 @@ config_operation() {
         get) jq -r ".$key" "$CONFIG_FILE";;
         set)
             local temp_file; temp_file=$(mktemp)
-            jq ".$key = \"$value\"" "$CONFIG_FILE" > "$temp_file" && mv "$temp_file" "$CONFIG_FILE"
+            # Use --arg for safe value injection
+            jq --arg v "$value" ".$key = \$v" "$CONFIG_FILE" > "$temp_file" && mv "$temp_file" "$CONFIG_FILE"
             log_success "Config updated: $key -> $value"
             ;;
         *) log_error "Unknown config op. Use view, get, set.";;
@@ -67,3 +67,5 @@ memory_operation() {
         *) log_error "Unknown memory op. Use search, clear.";;
     esac
 }
+
+sqlite_escape() { echo "$1" | sed "s/'/''/g"; }
