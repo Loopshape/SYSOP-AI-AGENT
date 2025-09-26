@@ -42,6 +42,48 @@ body {
   margin: 0 auto;
 }
 
+header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.75rem 1rem;
+    border-bottom: 1px solid var(--surface-color);
+    background-color: var(--background-color);
+}
+
+.header-title {
+    font-size: 1.2rem;
+    font-weight: bold;
+    color: var(--primary-text-color);
+}
+
+.header-buttons {
+    display: flex;
+    gap: 0.5rem;
+}
+
+#settings-button, #cicd-helper-button {
+    background: none;
+    border: none;
+    cursor: pointer;
+    padding: 0.5rem;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: background-color 0.2s ease;
+}
+
+#settings-button:hover, #cicd-helper-button:hover {
+    background-color: var(--surface-color);
+}
+
+#settings-button svg, #cicd-helper-button svg {
+    width: 24px;
+    height: 24px;
+    fill: var(--secondary-text-color);
+}
+
 #output {
   flex: 1;
   overflow-y: auto;
@@ -61,6 +103,7 @@ body {
   border-radius: var(--border-radius);
   white-space: pre-wrap;
   word-wrap: break-word;
+  position: relative;
 }
 
 .user-message-container {
@@ -111,13 +154,22 @@ body {
 
 
 /* Markdown styles */
-.ai-message p {
+.ai-content p, .docs-container p, .refactor-container p, .cicd-result-container p {
   margin-bottom: 1rem;
 }
 
-.ai-message h1,
-.ai-message h2,
-.ai-message h3 {
+.ai-content h1,
+.ai-content h2,
+.ai-content h3,
+.docs-container h1,
+.docs-container h2,
+.docs-container h3,
+.refactor-container h1,
+.refactor-container h2,
+.refactor-container h3,
+.cicd-result-container h1,
+.cicd-result-container h2,
+.cicd-result-container h3 {
   color: var(--accent-color);
   margin-top: 1.5rem;
   margin-bottom: 1rem;
@@ -125,13 +177,19 @@ body {
   padding-bottom: 0.3rem;
 }
 
-.ai-message ul,
-.ai-message ol {
+.ai-content ul,
+.ai-content ol,
+.docs-container ul,
+.docs-container ol,
+.refactor-container ul,
+.refactor-container ol,
+.cicd-result-container ul,
+.cicd-result-container ol {
   padding-left: 1.5rem;
   margin-bottom: 1rem;
 }
 
-.ai-message code {
+.ai-content code, .docs-container code, .refactor-container code, .cicd-result-container code {
   background-color: rgba(255, 255, 255, 0.1);
   padding: 0.2em 0.4em;
   margin: 0;
@@ -140,7 +198,7 @@ body {
   font-family: 'Fira Code', var(--font-family);
 }
 
-.ai-message pre {
+.ai-content pre, .docs-container pre, .refactor-container pre, .cicd-result-container pre {
   background-color: #0d0d0d;
   border: 1px solid var(--surface-color);
   padding: 1rem;
@@ -149,20 +207,20 @@ body {
   margin-bottom: 1rem;
 }
 
-.ai-message pre code {
+.ai-content pre code, .docs-container pre code, .refactor-container pre code, .cicd-result-container pre code {
   background-color: transparent;
   padding: 0;
 }
 
-.ai-message a {
+.ai-content a, .docs-container a, .refactor-container a, .cicd-result-container a {
   color: var(--accent-color);
   text-decoration: none;
 }
-.ai-message a:hover {
+.ai-content a:hover, .docs-container a:hover, .refactor-container a:hover, .cicd-result-container a:hover {
   text-decoration: underline;
 }
 
-.ai-message blockquote {
+.ai-content blockquote, .docs-container blockquote, .refactor-container blockquote, .cicd-result-container blockquote {
     border-left: 4px solid var(--accent-color);
     padding-left: 1rem;
     margin: 1rem 0;
@@ -229,16 +287,490 @@ body {
   padding: 1rem;
 }
 
+.error-message {
+    background-color: var(--ai-message-bg);
+    color: var(--primary-text-color);
+    border: 1px solid var(--error-color);
+    border-bottom-left-radius: 0;
+}
+
+.error-message::before {
+    content: '[ERROR]';
+    font-weight: bold;
+    color: var(--error-color);
+    display: block;
+    margin-bottom: 0.5rem;
+}
+
 /* Loading indicator */
-.loading .blinking-cursor {
+.loading .blinking-cursor, .docs-container .blinking-cursor, .refactor-container .blinking-cursor, .cicd-result-container .blinking-cursor {
     display: inline-block;
     width: 10px;
     height: 1.2rem;
     background-color: var(--accent-color);
     animation: blink 1s step-end infinite;
+    margin-top: 1rem;
 }
 
 @keyframes blink {
     from, to { background-color: transparent }
     50% { background-color: var(--accent-color); }
+}
+
+/* Syntax Highlighting theme overrides */
+.ai-message pre code.hljs, .docs-container pre code.hljs, .refactor-container pre code.hljs, .cicd-result-container pre code.hljs {
+  background: transparent;
+  padding: 0; /* Our <pre> element already has padding */
+}
+
+/* Modal Styles */
+.modal-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(0, 0, 0, 0.7);
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    z-index: 1000;
+}
+
+.modal-content {
+    background-color: var(--surface-color);
+    padding: 2rem;
+    border-radius: var(--border-radius);
+    width: 90%;
+    max-width: 800px;
+    max-height: 90vh;
+    overflow-y: auto;
+    position: relative;
+    border: 1px solid var(--accent-color);
+    box-shadow: 0 5px 15px rgba(0,0,0,0.5);
+}
+
+#close-modal-button, #close-cicd-modal-button {
+    position: absolute;
+    top: 1rem;
+    right: 1rem;
+    background: none;
+    border: none;
+    font-size: 1.5rem;
+    color: var(--secondary-text-color);
+    cursor: pointer;
+}
+
+.modal-content h2 {
+    color: var(--accent-color);
+    margin-bottom: 0.5rem;
+}
+.modal-content p, .modal-description {
+    color: var(--secondary-text-color);
+    margin-bottom: 1.5rem;
+}
+
+#system-instruction-form textarea,
+#cicd-modal textarea,
+#cicd-modal input,
+#cicd-modal select {
+    width: 100%;
+    background-color: var(--background-color);
+    color: var(--primary-text-color);
+    border: 1px solid var(--user-message-bg);
+    border-radius: var(--border-radius);
+    padding: 0.75rem;
+    font-family: var(--font-family);
+    font-size: 1rem;
+    resize: vertical;
+    margin-bottom: 1rem;
+}
+
+#system-instruction-form textarea:focus,
+#cicd-modal textarea:focus,
+#cicd-modal input:focus,
+#cicd-modal select:focus {
+    outline: none;
+    border-color: var(--accent-color);
+}
+
+#system-instruction-form button,
+#cicd-modal form button {
+    width: 100%;
+    padding: 0.75rem;
+    background-color: var(--accent-color);
+    color: var(--background-color);
+    border: none;
+    border-radius: var(--border-radius);
+    font-family: var(--font-family);
+    font-size: 1rem;
+    font-weight: bold;
+    cursor: pointer;
+    transition: background-color 0.2s ease;
+    margin-top: 1rem;
+}
+
+#system-instruction-form button:hover,
+#cicd-modal form button:hover {
+    background-color: #00e68a;
+}
+
+#cicd-modal form button:disabled {
+    background-color: var(--user-message-bg);
+    cursor: not-allowed;
+    color: var(--secondary-text-color);
+}
+
+.history-container {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 2rem;
+    margin-bottom: 1rem;
+    border-top: 1px solid var(--user-message-bg);
+    padding-top: 1rem;
+}
+
+.modal-content h3 {
+    color: var(--primary-text-color);
+}
+
+#clear-history-button {
+    background: none;
+    border: 1px solid var(--secondary-text-color);
+    color: var(--secondary-text-color);
+    padding: 0.25rem 0.75rem;
+    border-radius: var(--border-radius);
+    cursor: pointer;
+    font-size: 0.9rem;
+}
+
+#clear-history-button:hover {
+    background: var(--user-message-bg);
+    color: var(--primary-text-color);
+}
+
+#instruction-history {
+    max-height: 200px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--accent-color) var(--surface-color);
+}
+
+.history-item {
+    background-color: var(--background-color);
+    padding: 0.75rem;
+    border-radius: var(--border-radius);
+    margin-bottom: 0.5rem;
+    cursor: pointer;
+    font-size: 0.9rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: background-color 0.2s ease;
+}
+
+.history-item:hover {
+    background-color: var(--user-message-bg);
+}
+
+.empty-history {
+    color: var(--secondary-text-color);
+    font-style: italic;
+}
+
+/* Settings Styles in Modal */
+.setting-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 1.5rem;
+    margin-bottom: 0.5rem;
+}
+
+.setting-item label {
+    font-weight: bold;
+    color: var(--primary-text-color);
+}
+
+.setting-description {
+    font-size: 0.85rem;
+    color: var(--secondary-text-color);
+    margin-bottom: 1rem;
+}
+
+.toggle-switch {
+    position: relative;
+    display: inline-block;
+    width: 50px;
+    height: 28px;
+}
+
+.toggle-switch input {
+    opacity: 0;
+    width: 0;
+    height: 0;
+}
+
+.slider {
+    position: absolute;
+    cursor: pointer;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background-color: var(--background-color);
+    border: 1px solid var(--secondary-text-color);
+    transition: .4s;
+}
+
+.slider:before {
+    position: absolute;
+    content: "";
+    height: 20px;
+    width: 20px;
+    left: 3px;
+    bottom: 3px;
+    background-color: var(--secondary-text-color);
+    transition: .4s;
+}
+
+input:checked + .slider {
+    background-color: var(--accent-color);
+    border-color: var(--accent-color);
+}
+
+input:focus + .slider {
+    box-shadow: 0 0 1px var(--accent-color);
+}
+
+input:checked + .slider:before {
+    transform: translateX(22px);
+    background-color: var(--background-color);
+}
+
+.slider.round {
+    border-radius: 34px;
+}
+
+.slider.round:before {
+    border-radius: 50%;
+}
+
+
+/* Code Block Button Styles */
+.code-block-wrapper {
+    position: relative;
+}
+
+.code-copy-button, .code-docs-button, .code-refactor-button {
+    position: absolute;
+    top: 0.5rem;
+    background: var(--surface-color);
+    border: 1px solid var(--user-message-bg);
+    border-radius: 4px;
+    padding: 0.25rem;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.2s ease-in-out, background-color 0.2s ease-in-out;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1;
+}
+
+.code-copy-button {
+    right: 0.5rem;
+}
+
+.code-docs-button {
+    right: 2.5rem;
+}
+
+.code-refactor-button {
+    right: 4.5rem;
+}
+
+.code-docs-button:disabled, .code-refactor-button:disabled {
+    cursor: default;
+}
+
+.code-block-wrapper:hover .code-copy-button,
+.code-block-wrapper:hover .code-docs-button,
+.code-block-wrapper:hover .code-refactor-button {
+    opacity: 1;
+}
+
+.code-copy-button:hover, .code-docs-button:hover:not(:disabled), .code-refactor-button:hover:not(:disabled) {
+    background: var(--user-message-bg);
+}
+
+.code-copy-button svg, .code-docs-button svg, .code-refactor-button svg {
+    width: 18px;
+    height: 18px;
+    fill: var(--secondary-text-color);
+    transition: fill 0.2s ease-in-out;
+}
+
+.code-copy-button:hover svg, .code-docs-button:hover:not(:disabled) svg, .code-refactor-button:hover:not(:disabled) svg {
+    fill: var(--primary-text-color);
+}
+
+.code-copy-button.copied svg, .code-docs-button:disabled svg, .code-refactor-button:disabled svg {
+    fill: var(--accent-color);
+}
+
+/* Documentation & Refactor Container Styles */
+.docs-container, .refactor-container {
+    border: 1px solid var(--surface-color);
+    padding: 1rem;
+    margin-bottom: 1rem; /* Re-apply margin that was on the <pre> */
+}
+
+.docs-container {
+    background-color: #222222; /* Slightly different background */
+    border-top: none;
+    border-bottom-left-radius: var(--border-radius);
+    border-bottom-right-radius: var(--border-radius);
+}
+
+.refactor-container {
+    background-color: var(--surface-color);
+    border-radius: var(--border-radius);
+    border-top: 2px solid var(--accent-color);
+}
+
+.code-block-wrapper.docs-generated > pre {
+    margin-bottom: 0;
+    border-bottom-left-radius: 0;
+    border-bottom-right-radius: 0;
+}
+
+.code-block-wrapper.refactor-generated {
+    margin-bottom: 0.5rem; /* Add some space between original block and refactor container */
+}
+.code-block-wrapper.refactor-generated > pre {
+    margin-bottom: 0;
+}
+
+
+/* Sources Display Styles */
+.sources-container {
+    margin-top: 1rem;
+    padding-top: 0.75rem;
+    border-top: 1px solid var(--surface-color);
+}
+
+.sources-container h4 {
+    font-size: 0.9rem;
+    color: var(--secondary-text-color);
+    margin-bottom: 0.5rem;
+    text-transform: uppercase;
+}
+
+.sources-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.source-link {
+    display: block;
+    font-size: 0.85rem;
+    color: var(--accent-color);
+    text-decoration: none;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    transition: color 0.2s ease;
+}
+
+.source-link:hover {
+    color: #fff;
+    text-decoration: underline;
+}
+
+/* CI/CD Modal Specific Styles */
+.tab-container {
+    display: flex;
+    border-bottom: 1px solid var(--user-message-bg);
+    margin-bottom: 1.5rem;
+}
+
+.tab-button {
+    background: none;
+    border: none;
+    color: var(--secondary-text-color);
+    padding: 0.75rem 1.5rem;
+    cursor: pointer;
+    font-size: 1rem;
+    font-family: var(--font-family);
+    border-bottom: 2px solid transparent;
+    transition: color 0.2s, border-color 0.2s;
+}
+
+.tab-button:hover {
+    color: var(--primary-text-color);
+}
+
+.tab-button.active {
+    color: var(--accent-color);
+    border-bottom-color: var(--accent-color);
+}
+
+.tab-content {
+    display: none;
+}
+
+.tab-content.active {
+    display: block;
+}
+
+#cicd-modal form label {
+    display: block;
+    margin-bottom: 0.5rem;
+    font-weight: bold;
+    font-size: 0.9rem;
+    color: var(--secondary-text-color);
+}
+
+.cicd-result-container {
+    margin-top: 1.5rem;
+    background-color: var(--background-color);
+    border: 1px solid var(--user-message-bg);
+    border-radius: var(--border-radius);
+    padding: 1rem;
+    min-height: 50px;
+}
+
+.checkbox-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+    background-color: var(--background-color);
+    padding: 0.75rem;
+    border-radius: var(--border-radius);
+    border: 1px solid var(--user-message-bg);
+}
+
+.checkbox-group div {
+    display: flex;
+    align-items: center;
+}
+
+.checkbox-group input[type="checkbox"] {
+    margin-right: 0.75rem;
+    width: auto;
+    margin-bottom: 0;
+    accent-color: var(--accent-color);
+}
+
+.checkbox-group label {
+    display: inline-block;
+    margin-bottom: 0;
+    font-weight: normal;
+    font-size: 0.95rem;
+    color: var(--primary-text-color);
+    cursor: pointer;
 }
