@@ -695,6 +695,7 @@ input:checked + .slider:before {
     display: flex;
     border-bottom: 1px solid var(--user-message-bg);
     margin-bottom: 1.5rem;
+    flex-wrap: wrap;
 }
 
 .tab-button {
@@ -773,4 +774,24 @@ input:checked + .slider:before {
     font-size: 0.95rem;
     color: var(--primary-text-color);
     cursor: pointer;
+}
+
+#cicd-modal fieldset {
+    border: 1px solid var(--user-message-bg);
+    border-radius: var(--border-radius);
+    padding: 1rem;
+    margin-bottom: 1.5rem;
+}
+
+#cicd-modal legend {
+    padding: 0 0.5rem;
+    color: var(--accent-color);
+    font-weight: bold;
+}
+
+#git-helper-form button {
+    width: auto;
+    padding: 0.5rem 1rem;
+    font-size: 0.9rem;
+    margin-top: 0.5rem;
 }

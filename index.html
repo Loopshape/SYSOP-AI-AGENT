@@ -62,6 +62,7 @@
                 <button class="tab-button" data-tab="generate-tab-content">Generate New</button>
                 <button class="tab-button" data-tab="dockerfile-tab-content">Generate Dockerfile</button>
                 <button class="tab-button" data-tab="k8s-tab-content">Generate K8s</button>
+                <button class="tab-button" data-tab="git-tab-content">Git Helper</button>
             </div>
 
             <!-- Analyze Tab Content -->
@@ -205,6 +206,56 @@
                 </form>
                 <div id="k8s-result" class="cicd-result-container"></div>
             </div>
+
+            <!-- Git Helper Tab Content -->
+            <div id="git-tab-content" class="tab-content">
+                <form id="git-helper-form" onsubmit="return false;">
+                    <p class="modal-description">Generate common Git commands and get an AI-powered explanation of how they work.</p>
+            
+                    <fieldset>
+                        <legend>Clone a Repository</legend>
+                        <label for="git-repo-url">Repository URL (HTTPS or SSH)</label>
+                        <input type="text" id="git-repo-url" placeholder="https://github.com/user/repo.git">
+                        <button type="button" id="generate-clone-btn">Generate Clone Command</button>
+                    </fieldset>
+            
+                    <fieldset>
+                        <legend>Commit Changes</legend>
+                        <label for="git-commit-message">Commit Message</label>
+                        <input type="text" id="git-commit-message" placeholder="feat: Add new feature">
+                        <div class="checkbox-group" style="margin-bottom: 1rem;">
+                            <div>
+                                <input type="checkbox" id="git-add-all" name="git-add-all" checked>
+                                <label for="git-add-all">Add all changes (`git add -A`)</label>
+                            </div>
+                        </div>
+                        <button type="button" id="generate-commit-btn">Generate Commit Command</button>
+                    </fieldset>
+            
+                    <fieldset>
+                        <legend>Create a Branch</legend>
+                        <label for="git-branch-name">New Branch Name</label>
+                        <input type="text" id="git-branch-name" placeholder="feature/new-design">
+                        <div class="checkbox-group" style="margin-bottom: 1rem;">
+                            <div>
+                                <input type="checkbox" id="git-checkout-branch" name="git-checkout-branch" checked>
+                                <label for="git-checkout-branch">Switch to the new branch (`-b`)</label>
+                            </div>
+                        </div>
+                        <button type="button" id="generate-branch-btn">Generate Branch Command</button>
+                    </fieldset>
+
+                    <fieldset>
+                        <legend>View History</legend>
+                        <label for="git-log-count">Number of commits to show (optional)</label>
+                        <input type="number" id="git-log-count" placeholder="e.g., 5">
+                        <button type="button" id="generate-log-btn">Generate Log Command</button>
+                    </fieldset>
+                    
+                </form>
+                <div id="git-result" class="cicd-result-container"></div>
+            </div>
+
         </div>
     </div>
 

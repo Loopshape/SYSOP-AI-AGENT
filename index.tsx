@@ -38,6 +38,11 @@ const dockerfileTemplateSelect = document.getElementById('dockerfile-template-se
 const generateK8sForm = document.getElementById('generate-k8s-form') as HTMLFormElement;
 const k8sResult = document.getElementById('k8s-result') as HTMLDivElement;
 const k8sTemplateSelect = document.getElementById('k8s-template-select') as HTMLSelectElement;
+const gitResult = document.getElementById('git-result') as HTMLDivElement;
+const generateCloneBtn = document.getElementById('generate-clone-btn') as HTMLButtonElement;
+const generateCommitBtn = document.getElementById('generate-commit-btn') as HTMLButtonElement;
+const generateBranchBtn = document.getElementById('generate-branch-btn') as HTMLButtonElement;
+const generateLogBtn = document.getElementById('generate-log-btn') as HTMLButtonElement;
 
 
 // State and Constants
@@ -536,6 +541,56 @@ async function streamResponseToElement(prompt: string, targetElement: HTMLElemen
     }
 }
 
+async function generateAndExplainCommand(command: string, prompt: string, targetElement: HTMLElement, submitButton: HTMLButtonElement) {
+    const originalButtonText = submitButton.textContent;
+    submitButton.disabled = true;
+    submitButton.textContent = 'Generating...';
+    targetElement.innerHTML = ''; // Clear previous results
+
+    // 1. Create and display the command block immediately
+    const commandWrapper = document.createElement('div');
+    commandWrapper.innerHTML = await marked.parse(`\`\`\`sh\n${command}\n\`\`\``);
+    applySyntaxHighlighting(commandWrapper);
+    enhanceCodeBlocks(commandWrapper); // This will add the copy button etc.
+    targetElement.appendChild(commandWrapper);
+
+    // 2. Create a container for the explanation and add a loading indicator
+    const explanationContainer = document.createElement('div');
+    explanationContainer.className = 'explanation-container';
+    explanationContainer.innerHTML = '<hr><div class="blinking-cursor"></div>';
+    targetElement.appendChild(explanationContainer);
+
+    // 3. Stream the AI explanation
+    try {
+        const result = await ai.models.generateContentStream({
+            model: 'gemini-2.5-flash',
+            contents: prompt,
+            config: {
+                systemInstruction: 'You are an expert software engineer and Git instructor. Your explanations are clear, concise, and targeted at developers who may be new to Git.'
+            }
+        });
+
+        let fullResponse = '';
+        let isFirstChunk = true;
+
+        for await (const chunk of result) {
+            if (isFirstChunk) {
+                explanationContainer.innerHTML = '<hr>'; // Clear loading indicator, keep separator
+                isFirstChunk = false;
+            }
+            fullResponse += chunk.text;
+            explanationContainer.innerHTML = '<hr>' + await marked.parse(fullResponse);
+            applySyntaxHighlighting(explanationContainer);
+            enhanceCodeBlocks(explanationContainer); // Enhance any code blocks in the explanation
+        }
+    } catch (error) {
+        console.error("Streaming explanation failed:", error);
+        explanationContainer.innerHTML = '<div class="error">Failed to get an explanation. Please try again.</div>';
+    } finally {
+        submitButton.disabled = false;
+        submitButton.textContent = originalButtonText;
+    }
+}
 
 // --- Event Listeners ---
 form.addEventListener('submit', async (e) => {
@@ -844,6 +899,68 @@ After the code block, briefly explain the key choices made, such as why a certai
     await streamResponseToElement(prompt, k8sResult, submitButton);
 });
 
+generateCloneBtn.addEventListener('click', async () => {
+    const repoUrl = (document.getElementById('git-repo-url') as HTMLInputElement).value;
+    if (!repoUrl) return;
+
+    const command = `git clone ${repoUrl}`;
+    const prompt = `Explain the following Git command for a beginner. What does it do? What are some common options or best practices associated with it?
+
+\`\`\`sh
+${command}
+\`\`\``;
+    await generateAndExplainCommand(command, prompt, gitResult, generateCloneBtn);
+});
+
+generateCommitBtn.addEventListener('click', async () => {
+    const message = (document.getElementById('git-commit-message') as HTMLInputElement).value;
+    const addAll = (document.getElementById('git-add-all') as HTMLInputElement).checked;
+    if (!message) return;
+
+    const commands = [];
+    if (addAll) {
+        commands.push('git add -A');
+    }
+    commands.push(`git commit -m "${message}"`);
+    const commandBlock = commands.join('\n');
+
+    const prompt = `Explain the following sequence of Git commands for a beginner. What does each line do? Why is it important to write good commit messages?
+
+\`\`\`sh
+${commandBlock}
+\`\`\``;
+    await generateAndExplainCommand(commandBlock, prompt, gitResult, generateCommitBtn);
+});
+
+generateBranchBtn.addEventListener('click', async () => {
+    const branchName = (document.getElementById('git-branch-name') as HTMLInputElement).value;
+    const checkout = (document.getElementById('git-checkout-branch') as HTMLInputElement).checked;
+    if (!branchName) return;
+
+    const command = checkout ? `git checkout -b ${branchName}` : `git branch ${branchName}`;
+    const prompt = `Explain the following Git command for a beginner. What does it do? What's the difference between 'git branch' and 'git checkout -b'?
+
+\`\`\`sh
+${command}
+\`\`\``;
+    await generateAndExplainCommand(command, prompt, gitResult, generateBranchBtn);
+});
+
+generateLogBtn.addEventListener('click', async () => {
+    const count = (document.getElementById('git-log-count') as HTMLInputElement).value;
+    
+    let command = 'git log --oneline --graph --decorate';
+    if (count && parseInt(count, 10) > 0) {
+        command += ` -n ${parseInt(count, 10)}`;
+    }
+
+    const prompt = `Explain the following Git command for a beginner. What does each flag (--oneline, --graph, --decorate) do? Why is this a useful way to view commit history?
+
+\`\`\`sh
+${command}
+\`\`\``;
+    await generateAndExplainCommand(command, prompt, gitResult, generateLogBtn);
+});
 
 // Initial Load
 window.addEventListener('load', () => {
