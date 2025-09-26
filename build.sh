@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build.sh - A Shell-Based Bundler for Node.js Applications
+# build.sh - A Shell-Based Bundler for Node.js Applications (ESM Compatible)
 # This script packages a Node.js app (including node_modules) into a single,
 # self-extracting, executable shell script.
 
@@ -13,7 +13,6 @@ OUTPUT_FILE="ai-server.sh"
 TEMP_ARCHIVE="app.tar.gz"
 
 # --- COLORS & ICONS ---
-# FIX: Added color definitions directly into the script
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 ICON_SUCCESS="✅"; ICON_INFO="ℹ️"; ICON_ERROR="❌"
 
@@ -39,7 +38,6 @@ main() {
 
     # 2. --- Install/Verify Dependencies ---
     log "Ensuring all dependencies are installed locally..."
-    # Check if node_modules exists and has express, otherwise install
     if [[ ! -d "node_modules/express" || ! -d "node_modules/sqlite3" ]]; then
         log "Dependencies missing. Running 'npm install express sqlite3'..."
         npm install express sqlite3
@@ -49,14 +47,14 @@ main() {
 
     # 3. --- Create Temporary Archive ---
     log "Creating a compressed archive of the application..."
-    tar -czf "$TEMP_ARCHIVE" "$APP_ENTRY_POINT" "$PUBLIC_DIR" "node_modules"
+    # We also need package.json for module resolution
+    tar -czf "$TEMP_ARCHIVE" "$APP_ENTRY_POINT" "$PUBLIC_DIR" "node_modules" "package.json" "package-lock.json"
     log_success "Archive '$TEMP_ARCHIVE' created."
 
     # 4. --- Build the Self-Extracting Script ---
     log "Building the single-file executable: '$OUTPUT_FILE'..."
 
     # Create the header of the final script. This is the "runner" logic.
-    # It will create a temp directory, extract the payload, run the app, and clean up.
     cat > "$OUTPUT_FILE" <<'EOF'
 #!/usr/bin/env bash
 set -e
@@ -64,22 +62,20 @@ set -e
 # --- Self-Extracting Runner ---
 export AI_APP_TEMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t 'ai-app')
 
-# Cleanup function to remove temp directory on exit
 cleanup() {
     printf "\nCleaning up temporary files...\n"
     rm -rf "$AI_APP_TEMP_DIR"
 }
 trap cleanup EXIT
 
-# Find the line number where the payload starts
 PAYLOAD_LINE=$(awk '/^__PAYLOAD_BELOW__/ {print NR + 1; exit 0; }' "$0")
 
-# Extract the base64 payload, decode it, and untar it into the temp directory
 tail -n +$PAYLOAD_LINE "$0" | base64 --decode | tar -xzf - -C "$AI_APP_TEMP_DIR"
 
-# Run the Node.js application from the temporary location
-echo "Starting AI DevOps Platform..."
-node "$AI_APP_TEMP_DIR/server.js"
+echo "Starting AI DevOps Platform (ESM)..."
+# --- MODIFICATION FOR ESM ---
+# We now tell Node.js to treat the entry point as an ES Module.
+node --input-type=module --eval "import('./$AI_APP_TEMP_DIR/server.js')"
 
 exit 0
 
@@ -97,7 +93,7 @@ EOF
     chmod +x "$OUTPUT_FILE"
 
     log_success "Build complete!"
-    echo -e "\n${YELLOW}Your self-contained application is ready: ./${OUTPUT_FILE}${NC}"
+    echo -e "\n${YELLOW}Your self-contained ESM application is ready: ./${OUTPUT_FILE}${NC}"
     echo "You can now copy this single file to any machine with Node.js and run it."
 }
 

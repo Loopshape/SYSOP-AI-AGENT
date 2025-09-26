@@ -1,170 +1,192 @@
-#!/usr/bin/env node
-// tri_stream_server_json.mjs
-import http from "http";
-import { spawn } from "child_process";
-import url from "url";
-import path from "path";
-import { fileURLToPath } from "url";
+// server.js - ES Module Version
 
+import express from 'express';
+import { promises as fs } from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
+import { spawn } from 'child_process';
+import sqlite3 from 'sqlite3';
+
+// Helper for __dirname in ES Modules
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PORT = 8080;
-const AI_BIN = path.resolve(process.env.HOME, "bin/ai");
+const app = express();
+const PORT = process.env.AI_PORT || 3000;
 
-function workerFromLine(line) {
-  if (line.includes("WORKER: MESSENGER")) return "Messenger";
-  if (line.includes("WORKER: COMBINATOR")) return "Combinator";
-  if (line.includes("WORKER: TRADER")) return "Trader";
-  if (line.includes("WORKER: SYSTEM")) return "System";
-  return null;
+// --- Configuration ---
+const AI_HOME = process.env.AI_HOME || path.join(process.env.HOME, '.ai_agent');
+const PROJECTS_DIR = process.env.PROJECTS_DIR || path.join(process.env.HOME, 'ai_projects');
+const MEMORY_DB = path.join(AI_HOME, 'memory.db');
+
+const AGENT_MODEL = process.env.AGENT_MODEL || 'gemma2:9b';
+const REVIEWER_MODEL = process.env.REVIEWER_MODEL || 'llama3:8b';
+const COMBINATOR_MODEL = process.env.COMBINATOR_MODEL || 'llama3:8b';
+
+app.use(express.json());
+app.use(express.static(path.join(__dirname, 'public')));
+
+// --- Helper Functions ---
+async function ensureDirs() {
+    await fs.mkdir(AI_HOME, { recursive: true });
+    await fs.mkdir(PROJECTS_DIR, { recursive: true });
 }
 
-const server = http.createServer((req, res) => {
-  const parsedUrl = url.parse(req.url, true);
-
-  if (parsedUrl.pathname === "/ai") {
-    const userPrompt = parsedUrl.query.prompt || "";
-    if (!userPrompt) {
-      res.writeHead(400, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "missing ?prompt=" }));
-      return;
-    }
-
-    res.writeHead(200, {
-      "Content-Type": "text/event-stream",
-      "Cache-Control": "no-cache",
-      "Connection": "keep-alive",
+function initDB() {
+    const db = new (sqlite3.verbose().Database)(MEMORY_DB);
+    db.run(`CREATE TABLE IF NOT EXISTS verbose_history (
+        id INTEGER PRIMARY KEY,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        task_id TEXT,
+        model TEXT,
+        stage TEXT,
+        prompt TEXT,
+        output TEXT,
+        weight REAL
+    )`, (err) => {
+        if (err) console.error("DB Init Error:", err);
     });
+    db.close();
+}
 
-    const aiProc = spawn(AI_BIN, [userPrompt], {
-      env: { ...process.env, PATH: process.env.PATH },
-    });
+function runModel(model, prompt, timeout = 120000) {
+    return new Promise((resolve, reject) => {
+        const proc = spawn('ollama', ['run', model, prompt]);
+        let output = '', error = '';
 
-    let currentWorker = "System";
-    let inFinalAnswer = false;
+        proc.stdout.on('data', data => output += data.toString());
+        proc.stderr.on('data', data => error += data.toString());
 
-    function sendEvent(eventObj) {
-      res.write(`data: ${JSON.stringify(eventObj)}\n\n`);
-    }
+        const timer = setTimeout(() => {
+            proc.kill();
+            reject(new Error(`Model execution timeout for ${model}`));
+        }, timeout);
 
-    aiProc.stdout.on("data", (data) => {
-      data.toString().split(/\r?\n/).forEach((line) => {
-        if (!line.trim()) return;
-
-        // Detect final answer
-        if (line.includes("[FINAL_ANSWER]")) {
-          inFinalAnswer = true;
-        }
-
-        const detected = workerFromLine(line);
-        if (detected) currentWorker = detected;
-
-        sendEvent({
-          timestamp: new Date().toISOString(),
-          worker: currentWorker,
-          final: inFinalAnswer,
-          msg: line,
+        proc.on('close', code => {
+            clearTimeout(timer);
+            if (code === 0) resolve(output.trim());
+            else reject(new Error(error || `Model ${model} failed with code ${code}`));
         });
-      });
     });
-
-    aiProc.stderr.on("data", (data) => {
-      data.toString().split(/\r?\n/).forEach((line) => {
-        if (!line.trim()) return;
-        sendEvent({
-          timestamp: new Date().toISOString(),
-          worker: "Error",
-          final: false,
-          msg: line,
-        });
-      });
-    });
-
-    aiProc.on("close", (code) => {
-      sendEvent({
-        timestamp: new Date().toISOString(),
-        worker: "System",
-        final: false,
-        msg: `Triumvirate finished with code ${code}`,
-      });
-      res.end();
-    });
-  }
-
-  else if (parsedUrl.pathname === "/" || parsedUrl.pathname === "/index.html") {
-    res.writeHead(200, { "Content-Type": "text/html" });
-    res.end(`
-<!doctype html>
-<html>
-<head>
-  <title>Triumvirate Agent Live JSON</title>
-  <style>
-    body { font-family: monospace; background:#111; color:#eee; }
-    .logbox { padding:6px; margin:4px 0; border:1px solid #444; white-space:pre-wrap; max-height:200px; overflow-y:auto; }
-    #Messenger{background:#202b33;color:#9cf;}
-    #Combinator{background:#1a1a2e;color:#c9f;}
-    #Trader{background:#2e1a1a;color:#fc9;}
-    #System{background:#1f1f1f;color:#aaa;}
-    #Error{background:#330000;color:#f66;}
-    #FinalAnswer{background:#003300;color:#9f9;font-weight:bold;}
-  </style>
-</head>
-<body>
-<h1>Triumvirate Mind (Structured JSON UI)</h1>
-<form onsubmit="launch(event)">
-<input type="text" id="prompt" size="60" placeholder="Enter request" />
-<button type="submit">Run</button>
-</form>
-
-<div id="System" class="logbox"></div>
-<div id="Messenger" class="logbox"></div>
-<div id="Combinator" class="logbox"></div>
-<div id="Trader" class="logbox"></div>
-<div id="Error" class="logbox"></div>
-<div id="FinalAnswer" class="logbox"></div>
-<button onclick="downloadFinal()">⬇️ Download Final Answer</button>
-
-<script>
-function appendLog(id, msg) {
-  const box = document.getElementById(id);
-  box.innerText += msg + "\\n";
-  box.scrollTop = box.scrollHeight;
 }
 
-function launch(e) {
-  e.preventDefault();
-  ["System","Messenger","Combinator","Trader","Error","FinalAnswer"].forEach(id=>document.getElementById(id).innerText="");
-  const prompt=document.getElementById("prompt").value;
-  const evt=new EventSource("/ai?prompt="+encodeURIComponent(prompt));
-
-  evt.onmessage=(e)=>{
-    const obj=JSON.parse(e.data);
-    const target=obj.final ? "FinalAnswer" : obj.worker;
-    appendLog(target,obj.timestamp+": "+obj.msg);
-  };
+async function logVerbose(taskId, model, stage, prompt, output, weight = 0) {
+    const db = new (sqlite3.verbose().Database)(MEMORY_DB);
+    return new Promise((resolve, reject) => {
+        db.run(
+            `INSERT INTO verbose_history (task_id, model, stage, prompt, output, weight)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+            [taskId, model, stage, prompt, output, weight],
+            (err) => {
+                if (err) {
+                    console.error("Verbose logging failed:", err);
+                    reject(err);
+                } else {
+                    resolve();
+                }
+                db.close();
+            }
+        );
+    });
 }
 
-function downloadFinal() {
-  const text=document.getElementById("FinalAnswer").innerText.trim();
-  if(!text){alert("No Final Answer yet!"); return;}
-  const blob=new Blob([text],{type:"text/plain"});
-  const url=URL.createObjectURL(blob);
-  const a=document.createElement("a");
-  a.href=url;
-  a.download="final_answer.txt";
-  a.click();
-  URL.revokeObjectURL(url);
-}
-</script>
-</body>
-</html>`);
-  }
+// --- AI Workflow ---
+async function runAITask(prompt, taskId) {
+    const agentPrompt = `You are an expert developer. Create a detailed, actionable plan and write the necessary code or commands to solve the user's request. User Request: ${prompt}`;
+    const reviewerPrompt = `You are a critical code reviewer. Analyze the user's request. Identify potential bugs, security vulnerabilities, and areas for improvement. Propose a refined, more robust solution. User Request: ${prompt}`;
 
-  else {
-    res.writeHead(404,{ "Content-Type": "text/plain"});
-    res.end("404 Not Found");
-  }
+    const promises = [
+        runModel(AGENT_MODEL, agentPrompt),
+        runModel(REVIEWER_MODEL, reviewerPrompt)
+    ];
+    const results = await Promise.allSettled(promises);
+
+    const agentOutput = results[0].status === 'fulfilled' ? results[0].value : `Error: ${results[0].reason.message}`;
+    const reviewerOutput = results[1].status === 'fulfilled' ? results[1].value : `Error: ${results[1].reason.message}`;
+
+    await logVerbose(taskId, AGENT_MODEL, 'initial_agent', agentPrompt, agentOutput);
+    await logVerbose(taskId, REVIEWER_MODEL, 'initial_reviewer', reviewerPrompt, reviewerOutput);
+
+    return [{ model: AGENT_MODEL, output: agentOutput }, { model: REVIEWER_MODEL, output: reviewerOutput }];
+}
+
+async function aggregateWithCore(pool, taskId) {
+    const poolContext = pool.map(o => `--- Output from ${o.model} ---\n${o.output}`).join('\n\n');
+    const controlPrompt = `You are the Core Combinator AI. Synthesize the insights from the Agent and Reviewer. Resolve conflicts and produce a single, complete, and definitive final answer or code solution.\n\n${poolContext}\n\n---
+Based on the above, provide the final, executable solution.`;
+
+    const finalOutput = await runModel(COMBINATOR_MODEL, controlPrompt);
+    await logVerbose(taskId, COMBINATOR_MODEL, 'final_answer', controlPrompt, finalOutput);
+    return finalOutput;
+}
+
+// --- API Routes ---
+app.post('/api/command', async (req, res) => {
+    try {
+        const { command } = req.body;
+        if (!command) return res.status(400).json({ success: false, error: 'Command is required.' });
+
+        const taskId = `task_${Date.now()}`;
+        const taskDir = path.join(PROJECTS_DIR, taskId);
+        await fs.mkdir(taskDir, { recursive: true });
+
+        const pool = await runAITask(command, taskId);
+
+        await fs.writeFile(path.join(taskDir, 'pool.json'), JSON.stringify(pool, null, 2));
+        res.json({ success: true, pool_task: taskId, message: `Task created with ${pool.length} model outputs` });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ success: false, error: err.message });
+    }
 });
 
-server.listen(PORT,()=>console.log(`Triumvirate JSON SSE server at http://localhost:${PORT}/`));
+app.get('/api/pool', async (req, res) => {
+    try {
+        const taskId = req.query.task;
+        if (!taskId) return res.status(400).json({ error: 'Task ID is required.' });
+        const data = await fs.readFile(path.join(PROJECTS_DIR, taskId, 'pool.json'), 'utf8');
+        res.json(JSON.parse(data));
+    } catch (err) {
+        res.status(404).json({ error: 'Pool not found' });
+    }
+});
+
+app.post('/api/finalize', async (req, res) => {
+    try {
+        const { task, pool } = req.body;
+        if (!task || !pool) return res.status(400).json({ error: 'Task and pool are required.' });
+        const final = await aggregateWithCore(pool, task);
+        const taskDir = path.join(PROJECTS_DIR, task);
+        await fs.writeFile(path.join(taskDir, 'final.txt'), final);
+        res.json({ final });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/api/history', async (req, res) => {
+    const taskId = req.query.task;
+    if (!taskId) return res.status(400).json({ error: 'Task ID is required.' });
+    const db = new (sqlite3.verbose().Database)(MEMORY_DB);
+    db.all("SELECT * FROM verbose_history WHERE task_id=? ORDER BY timestamp ASC", [taskId], (err, rows) => {
+        if (err) return res.status(500).json({ error: err.message });
+        res.json(rows);
+        db.close();
+    });
+});
+
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+
+// --- Start Server ---
+async function startServer() {
+    await ensureDirs();
+    initDB();
+    app.listen(PORT, () => {
+        console.log(`🤖 AI DevOps Platform v14.1+ (ESM) running at http://localhost:${PORT}`);
+    });
+}
+
+startServer();
