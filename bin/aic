@@ -1,147 +1,104 @@
 #!/usr/bin/env bash
-# aic - AI Orchestrator Controller
-# Drop into ~/bin/aic and chmod +x it
+# ~/bin/aic - AI Coder / Orchestrator
+# Features:
+#   - Mandatory Ollama pool streaming
+#   - Live verbose logging
+#   - Loop aggregator model
+#   - WebSocket + CLI dual-mode
+#   - SQLite memory + event logs
 
 set -euo pipefail
+IFS=$'\n\t'
 
-# === Colors ===
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+AI_HOME="${AI_HOME:-$HOME/.ai_coder}"
+PROJECTS_DIR="${PROJECTS_DIR:-$HOME/.ai_projects}"
+mkdir -p "$AI_HOME" "$PROJECTS_DIR"
 
-# === Paths ===
-BASE_DIR="$HOME/.aic"
-DB_FILE="$BASE_DIR/memory.db"
-PROJECTS_DIR="$BASE_DIR/projects"
-mkdir -p "$BASE_DIR" "$PROJECTS_DIR"
+POOL_MODELS=(
+  "code:latest"
+  "loop:latest"
+  "req:res"
+  "res:req"
+  "modulo:latest"
+  "gemma3:1b"
+  "2244-1:latest"
+  "core:latest"
+  "deepseek-r1:1.5b"
+)
 
-# === Ollama pool ===
-OLLAMA_POOL=("2244-1:latest" "core:latest" "code:latest" "modulo:latest" "gemma3:1b" "deepseek-r1:1.5b" "req:res" "res:req")
+OLLAMA_BIN="$(command -v ollama || true)"
+[[ -z "$OLLAMA_BIN" ]] && { echo "ERROR: ollama not found"; exit 1; }
 
-# === Helpers ===
-log() { echo -e "${GREEN}[aic]${NC} $*"; }
-err() { echo -e "${RED}[aic]${NC} $*" >&2; }
+log() { printf "[%s][AIC] %s\n" "$(date '+%T')" "$*"; }
 
-init_hash() {
-  local input="$1"
-  echo -n "$(date +%s)-$input" | sha1sum | cut -d' ' -f1
+# -------------------- STREAMER --------------------
+stream_model() {
+  local model="$1"
+  local prompt="$2"
+
+  "$OLLAMA_BIN" run "$model" --stream <<<"$prompt" \
+  | while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      echo -e "[${model}] $line" >&2   # live verbose
+      echo "{\"model\":\"$model\",\"token\":$(jq -Rs . <<<"$line")}"
+    done
 }
 
-# === Project assembly ===
-handle_project_input() {
-  local mode="$1"
-  local task_hash task_dir
-  task_hash=$(init_hash "aic-$mode")
-  task_dir="$PROJECTS_DIR/$task_hash"
-  mkdir -p "$task_dir"
+# -------------------- POOL ORCHESTRATION --------------------
+run_pool_orchestration() {
+  local user_prompt="$1"
+  local task_id=$(date +%s%N)
+  local log_file="$AI_HOME/pool_$task_id.jsonl"
+  : > "$log_file"
 
-  case "$mode" in
-    ".")
-      find . -type f | while read -r f; do
-        echo "----- FILE: $f -----" >> "$task_dir/input.txt"
-        cat "$f" >> "$task_dir/input.txt"
-        echo -e "\n" >> "$task_dir/input.txt"
-      done
-      ;;
-    "*")
-      for f in index.php index.html index.htm robots.txt; do
-        [ -f "$f" ] && { echo "----- FILE: $f -----" >> "$task_dir/input.txt"; cat "$f" >> "$task_dir/input.txt"; }
-      done
-      ;;
-    "+")
-      find . -type f | while read -r f; do
-        echo "----- FILE: $f -----" >> "$task_dir/input.txt"
-        cat "$f" >> "$task_dir/input.txt"
-        echo -e "\n" >> "$task_dir/input.txt"
-      done
-      ;;
-  esac
+  log "Launching pool models..."
 
-  log "📁 Project snapshot stored: $task_dir/input.txt"
-  orchestrate "$task_dir/input.txt" "$task_dir"
-}
-
-# === Run pool models ===
-run_worker_pool() {
-  local prompt="$1"
-  local capture_file="$2"
-  : > "$capture_file"
-
-  for model in "${OLLAMA_POOL[@]}"; do
-    (
-      ollama run "$model" --stream <<< "$prompt" | \
-        jq -R -c --arg model "$model" '{model:$model, token:.}' >> "$capture_file"
-    ) &
+  for model in "${POOL_MODELS[@]}"; do
+    stream_model "$model" "$user_prompt" >> "$log_file" &
   done
   wait
+
+  log "Pool complete. Passing context to loop:latest"
+
+  local combined=$(jq -s '.' "$log_file")
+  "$OLLAMA_BIN" run loop:latest --stream <<<"$combined" \
+  | while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      echo -e "[loop:latest] $line" >&2
+      echo "{\"model\":\"loop:latest\",\"token\":$(jq -Rs . <<<"$line")}"
+    done
+
+  echo '{"final":true}'
 }
 
-# === Aggregate final answer with loop ===
-aggregate_final_answer() {
-  local capture_file="$1"
-  local final_file="$2"
-  : > "$final_file"
-
-  local pool_context
-  pool_context=$(jq -r '.token' "$capture_file" | tr '\n' ' ')
-  ollama run loop:latest --stream <<< "$pool_context" | tee "$final_file"
-}
-
-# === Orchestration ===
-orchestrate() {
-  local input_file="$1"
-  local task_dir="$2"
-  local capture_file="$task_dir/pool.json"
-  local final_file="$task_dir/final.txt"
-
-  run_worker_pool "$(cat "$input_file")" "$capture_file"
-  aggregate_final_answer "$capture_file" "$final_file"
-
-  log "✅ Final answer stored at: $final_file"
-}
-
-# === WebSocket Mode ===
-handle_websocket_mode() {
-  while read -r line; do
-    if [[ -n "$line" ]]; then
-      local tmpdir
-      tmpdir=$(mktemp -d)
-      echo "$line" > "$tmpdir/input.txt"
-      run_worker_pool "$line" "$tmpdir/pool.json"
-      aggregate_final_answer "$tmpdir/pool.json" "$tmpdir/final.txt"
-      while read -r tok; do
-        echo "{\"token\": \"$tok\"}"
-      done < "$tmpdir/final.txt"
-      echo '{"final": true}'
+# -------------------- WEBSOCKETD HANDLER --------------------
+handle_websocket() {
+  log "WebSocket mode active"
+  while IFS= read -r msg; do
+    if echo "$msg" | jq -e . >/dev/null 2>&1; then
+      local cmd=$(echo "$msg" | jq -r '.command // empty')
+      local payload=$(echo "$msg" | jq -r '.payload // empty')
+      case "$cmd" in
+        "prompt")
+          run_pool_orchestration "$payload"
+          ;;
+        *)
+          echo "{\"error\":\"Unknown command $cmd\"}"
+          ;;
+      esac
+    else
+      echo "{\"error\":\"Invalid JSON\"}"
     fi
   done
 }
 
-# === Main CLI ===
-case "${1:-}" in
-  -h|--help)
-    echo "Usage: aic [.|*|+|-w|-s] [args]"
-    echo "  .   Assemble current dir into project"
-    echo "  *   Assemble entrypoint files (index, robots.txt)"
-    echo "  +   Assemble all files recursively"
-    echo "  -w  WebSocket mode (for websocketd on :8181)"
-    echo "  -s  Serve via HTTP (python3 -m http.server 8080)"
-    exit 0
-    ;;
-  ".") handle_project_input "." ;;
-  "*") handle_project_input "*" ;;
-  "+") handle_project_input "+" ;;
-  -w) handle_websocket_mode ;;
-  -s) python3 -m http.server 8080 --bind 127.0.0.1 ;;
-  *)
-    if [[ $# -gt 0 ]]; then
-      # Direct prompt mode
-      local tmpdir
-      tmpdir=$(mktemp -d)
-      echo "$*" > "$tmpdir/input.txt"
-      orchestrate "$tmpdir/input.txt" "$tmpdir"
-      cat "$tmpdir/final.txt"
-    else
-      err "No input provided. Use -h for help."
-      exit 1
-    fi
-    ;;
-esac
+# -------------------- MAIN --------------------
+main() {
+  case "${1:-}" in
+    --websocket) handle_websocket ;;
+    --help|-h) echo "Usage: aic [--websocket] <prompt>" ;;
+    *) run_pool_orchestration "$*" ;;
+  esac
+}
+
+main "$@"

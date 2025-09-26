@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""
+bip32_all_tokens
+Usage:
+  bip32_all_tokens <hex_entropy> [num_addresses]
+
+Outputs:
+  - BIP39 mnemonic (English)
+  - seed (hex)
+  - For i in [0..num_addresses-1]: derived private key (hex), BTC legacy address (P2PKH),
+    BTC bech32 P2WPKH address, Litecoin P2PKH, Dogecoin P2PKH, Ethereum address (used by ERC-20).
+Notes:
+  - This script requires: ecdsa, base58, pycryptodome
+    Install with: pip install ecdsa base58 pycryptodome
+  - Works offline once dependencies are installed.
+  - Use safely on an offline machine if you care about secrecy.
+"""
+import sys, os, hmac, hashlib, struct, binascii
+
+# try imports and instruct if missing
+try:
+    from ecdsa import SigningKey, SECP256k1
+    from ecdsa.util import number_to_string, string_to_number
+except Exception as e:
+    print("Missing 'ecdsa' package. Install: pip install ecdsa")
+    sys.exit(1)
+try:
+    import base58
+except Exception:
+    print("Missing 'base58' package. Install: pip install base58")
+    sys.exit(1)
+try:
+    # pycryptodome provides keccak via Crypto.Hash.keccak
+    from Crypto.Hash import keccak
+except Exception:
+    print("Missing 'pycryptodome' package. Install: pip install pycryptodome")
+    sys.exit(1)
+
+# minimal bech32 (BIP173) encode implementation
+CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+
+def bech32_polymod(values):
+    GEN = [0x3b6a57b2,0x26508e6d,0x1ea119fa,0x3d4233dd,0x2a1462b3]
+    chk = 1
+    for v in values:
+        b = (chk >> 25)
+        chk = ((chk & 0x1ffffff) << 5) ^ v
+        for i in range(5):
+            if ((b >> i) & 1):
+                chk ^= GEN[i]
+    return chk
+
+def bech32_hrp_expand(hrp):
+    return [ord(x) >> 5 for x in hrp] + [0] + [ord(x) & 31 for x in hrp]
+
+def bech32_create_checksum(hrp, data):
+    values = bech32_hrp_expand(hrp) + data
+    polymod = bech32_polymod(values + [0,0,0,0,0,0]) ^ 1
+    return [(polymod >> 5*(5-i)) & 31 for i in range(6)]
+
+def bech32_encode(hrp, data):
+    combined = data + bech32_create_checksum(hrp, data)
+    return hrp + "1" + "".join([CHARSET[d] for d in combined])
+
+def convertbits(data, frombits, tobits, pad=True):
+    acc=0; bits=0; ret=[]
+    maxv=(1<<tobits)-1
+    for b in data:
+        acc = (acc<<frombits) | b
+        bits += frombits
+        while bits >= tobits:
+            bits -= tobits
+            ret.append((acc >> bits) & maxv)
+    if pad:
+        if bits:
+            ret.append((acc << (tobits - bits)) & maxv)
+    elif bits >= frombits or ((acc << (tobits - bits)) & maxv):
+        return None
+    return ret
+
+# BIP39 english wordlist (small internal check uses full list from file if available)
+# For brevity in this script we will attempt to load a bundled wordlist that user may provide.
+# If not found, fall back to requiring 'wordlist' file present in same directory.
+SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
+WORDLIST_PATH = os.path.join(SCRIPT_DIR, "bip39_english_wordlist.txt")
+if os.path.exists(WORDLIST_PATH):
+    with open(WORDLIST_PATH, "r", encoding="utf8") as f:
+        WORDS = [w.strip() for w in f.readlines() if w.strip()]
+else:
+    # fallback minimal 2048-word embed could be included; to keep script size moderate we ask user to place file.
+    print("Please place BIP39 English wordlist at:", WORDLIST_PATH)
+    print("You can download from: https://raw.githubusercontent.com/bitcoin/bips/master/bip-0039/english.txt")
+    sys.exit(1)
+
+# helpers
+def sha256(b): return hashlib.sha256(b).digest()
+def hmac_sha512(key, data): return hmac.new(key, data, hashlib.sha512).digest()
+
+def entropy_to_mnemonic(entropy_hex):
+    entropy = bytes.fromhex(entropy_hex)
+    ENT = len(entropy)*8
+    if ENT not in (128,160,192,224,256):
+        raise ValueError("Entropy bits must be one of 128/160/192/224/256")
+    checksum = sha256(entropy)
+    CS = ENT // 32
+    ent_bits = bin(int.from_bytes(entropy,'big'))[2:].zfill(ENT)
+    cs_bits = bin(int.from_bytes(checksum,'big'))[2:].zfill(256)[:CS]
+    bits = ent_bits + cs_bits
+    words=[]
+    for i in range(0,len(bits),11):
+        idx = int(bits[i:i+11],2)
+        words.append(WORDS[idx])
+    return " ".join(words)
+
+def mnemonic_to_seed(mnemonic, passphrase=""):
+    salt = ("mnemonic" + passphrase).encode()
+    return hashlib.pbkdf2_hmac('sha512', mnemonic.encode(), salt, 2048)
+
+# BIP32 (full proper implementation using secp256k1)
+curve = SECP256k1
+G = curve.generator
+N = curve.order
+
+def ser32(i): return struct.pack(">L", i)
+def ser256(i): return i.to_bytes(32, 'big')
+
+def parse256(b): return int.from_bytes(b, 'big')
+
+def point_pubkey(point, compressed=True):
+    x = point.x()
+    y = point.y()
+    xb = x.to_bytes(32, 'big')
+    if compressed:
+        prefix = b'\x02' if (y % 2 == 0) else b'\x03'
+        return prefix + xb
+    else:
+        return b'\x04' + xb + y.to_bytes(32,'big')
+
+def privkey_to_pubkey(privkey_bytes):
+    sk = SigningKey.from_string(privkey_bytes, curve=curve)
+    vk = sk.get_verifying_key()
+    # ecdsa.VerifyingKey provides to_string() as raw x||y
+    xy = vk.to_string()
+    x = xy[:32]; y = xy[32:]
+    y_int = int.from_bytes(y, 'big')
+    prefix = b'\x02' if (y_int % 2 == 0) else b'\x03'
+    return prefix + x
+
+def base58check_encode(prefix, payload):
+    b = bytes([prefix]) + payload
+    chk = sha256(sha256(b))[:4]
+    return base58.b58encode(b + chk).decode()
+
+# Bech32 P2WPKH address (hrp "bc" for mainnet)
+def pubkey_to_bech32(pubkey_bytes, hrp="bc"):
+    # convert compressed pubkey to pubkey hash (20 bytes)
+    h160 = hashlib.new('ripemd160', sha256(pubkey_bytes)).digest()
+    data = [0] + convertbits(h160, 8, 5)
+    return bech32_encode(hrp, data)
+
+# Ethereum address (keccak-256 of uncompressed pubkey, last 20 bytes)
+def keccak256(b): 
+    k = keccak.new(digest_bits=256)
+    k.update(b)
+    return k.digest()
+
+def pubkey_to_eth_address(pubkey_bytes):
+    # need uncompressed pubkey (0x04 || X || Y)
+    # we can reconstruct using ecdsa
+    # get VerifyingKey from compressed pubkey:
+    # ecdsa does not provide direct compressed->VerifyingKey constructor, so derive from privkey path earlier.
+    # Here we accept pubkey_bytes compressed; expand:
+    prefix = pubkey_bytes[0]
+    x = int.from_bytes(pubkey_bytes[1:33], 'big')
+    # recover y using curve equation y^2 = x^3 + ax + b mod p
+    p = curve.curve.p()
+    a = curve.curve.a()
+    b = curve.curve.b()
+    alpha = (pow(x,3,p) + a * x + b) % p
+    beta = pow(alpha, (p+1)//4, p)
+    # choose y with parity matching prefix
+    if (beta % 2 == 0 and prefix == 0x02) or (beta % 2 == 1 and prefix == 0x03):
+        y = beta
+    else:
+        y = p - beta
+    x_bytes = x.to_bytes(32,'big')
+    y_bytes = y.to_bytes(32,'big')
+    uncompressed = b'\x04' + x_bytes + y_bytes
+    addr = keccak256(uncompressed[1:])[12:]  # last 20 bytes
+    return "0x" + addr.hex()
+
+# BIP32 CKDpriv and derivation
+def CKD_priv(k_par, c_par, index):
+    if index & 0x80000000:
+        data = b'\x00' + k_par + ser32(index)
+    else:
+        pub = privkey_to_pubkey(k_par)
+        data = pub + ser32(index)
+    I = hmac_sha512(c_par, data)
+    Il, Ir = I[:32], I[32:]
+    il_int = int.from_bytes(Il, 'big')
+    if il_int >= N:
+        raise Exception("Il >= N, very unlikely, try next index")
+    k_int = (il_int + int.from_bytes(k_par, 'big')) % N
+    if k_int == 0:
+        raise Exception("Derived zero private key, very unlikely")
+    return k_int.to_bytes(32,'big'), Ir
+
+def derive_path(k_master, c_master, path):
+    k = k_master; c = c_master
+    for step in path.split('/'):
+        if step == 'm' or step == '':
+            continue
+        hardened = step.endswith("'")
+        index = int(step.rstrip("'"))
+        if hardened:
+            index = index + 0x80000000
+        k, c = CKD_priv(k, c, index)
+    return k, c
+
+def master_from_seed(seed):
+    I = hmac_sha512(b"Bitcoin seed", seed)
+    return I[:32], I[32:]
+
+# wrapper to produce addresses for standard coins
+def derive_for_index(seed, account=0, change=0, index=0):
+    k_master, c_master = master_from_seed(seed)
+    # BIP44 path: m/44'/0'/account'/change/index
+    path = f"m/44'/0'/{account}'/{change}/{index}"
+    k_child, c_child = derive_path(k_master, c_master, path)
+    priv_hex = k_child.hex()
+    pub_comp = privkey_to_pubkey(k_child)
+    btc_p2pkh = base58check_encode(0x00, hashlib.new('ripemd160', sha256(pub_comp)).digest())
+    btc_bech32 = pubkey_to_bech32(pub_comp, hrp="bc")
+    # Litecoin (legacy P2PKH) uses prefix 0x30 (48)
+    ltc = base58check_encode(0x30, hashlib.new('ripemd160', sha256(pub_comp)).digest())
+    # Dogecoin prefix 0x1e (30)
+    doge = base58check_encode(0x1e, hashlib.new('ripemd160', sha256(pub_comp)).digest())
+    eth = pubkey_to_eth_address(pub_comp)
+    return {
+        "privkey_hex": priv_hex,
+        "pubkey_hex": pub_comp.hex(),
+        "btc_p2pkh": btc_p2pkh,
+        "btc_bech32": btc_bech32,
+        "litecoin_p2pkh": ltc,
+        "dogecoin_p2pkh": doge,
+        "ethereum_address": eth
+    }
+
+def pretty_print_results(mnemonic, seed_hex, results):
+    print("Mnemonic:\n", mnemonic)
+    print("Seed (hex):", seed_hex)
+    print("-" * 60)
+    for i, r in enumerate(results):
+        print(f"Index {i}:")
+        print("  Private key (hex):", r['privkey_hex'])
+        print("  Pubkey (compressed hex):", r['pubkey_hex'])
+        print("  BTC (P2PKH):", r['btc_p2pkh'])
+        print("  BTC (P2WPKH bech32):", r['btc_bech32'])
+        print("  Litecoin (P2PKH):", r['litecoin_p2pkh'])
+        print("  Dogecoin (P2PKH):", r['dogecoin_p2pkh'])
+        print("  Ethereum address (for ETH & ERC-20 tokens):", r['ethereum_address'])
+        print("-" * 60)
+    print("Note: Any ERC-20 token uses the Ethereum address above. To receive tokens you use the ETH address.")
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: bip32_all_tokens <hex_entropy> [num_addresses]")
+        sys.exit(1)
+    entropy_hex = sys.argv[1].strip()
+    num = int(sys.argv[2]) if len(sys.argv) >= 3 else 3
+    try:
+        mnemonic = entropy_to_mnemonic(entropy_hex)
+    except Exception as e:
+        print("Entropy -> mnemonic error:", e)
+        sys.exit(1)
+    seed = mnemonic_to_seed(mnemonic)
+    results = []
+    for i in range(num):
+        res = derive_for_index(seed, account=0, change=0, index=i)
+        results.append(res)
+    pretty_print_results(mnemonic, seed.hex(), results)
+
+if __name__ == "__main__":
+    main()

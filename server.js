@@ -1,240 +1,170 @@
 #!/usr/bin/env node
-// Triumvirate JSON SSE Server - Modern URL API Edition
-const http = import('http');
-const { spawn } = import('child_process');
-const path = import('path');
-const fs = import('fs');
+// tri_stream_server_json.mjs
+import http from "http";
+import { spawn } from "child_process";
+import url from "url";
+import path from "path";
+import { fileURLToPath } from "url";
 
-// Remove deprecated url.parse and use WHATWG URL API
-class TriumvirateServer {
-    constructor(port = 8080) {
-        this.port = port;
-        this.server = http.createServer(this.handleRequest.bind(this));
-        this.setupRoutes();
-    }
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
-    setupRoutes() {
-        this.routes = {
-            '/status': this.handleStatus.bind(this),
-            '/prompt': this.handlePrompt.bind(this),
-            '/memory': this.handleMemory.bind(this),
-            '/config': this.handleConfig.bind(this)
-        };
-    }
+const PORT = 8080;
+const AI_BIN = path.resolve(process.env.HOME, "bin/ai");
 
-    // Modern URL parsing using WHATWG URL API
-    parseUrl(request) {
-        const base = `http://${request.headers.host || 'localhost'}`;
-        try {
-            return new URL(request.url, base);
-        } catch (error) {
-            // Fallback for malformed URLs
-            return new URL('/', base);
-        }
-    }
-
-    handleRequest(request, response) {
-        const url = this.parseUrl(request);
-        const pathname = url.pathname;
-        
-        console.log(`[${new Date().toISOString()}] ${request.method} ${pathname}`);
-
-        // Set CORS headers for all responses
-        response.setHeader('Access-Control-Allow-Origin', '*');
-        response.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-        response.setHeader('Access-Control-Allow-Headers', 'Content-Type');
-
-        if (request.method === 'OPTIONS') {
-            response.writeHead(200);
-            response.end();
-            return;
-        }
-
-        const routeHandler = this.routes[pathname];
-        if (routeHandler) {
-            routeHandler(request, response, url);
-        } else {
-            this.handleNotFound(response);
-        }
-    }
-
-    handleStatus(request, response, url) {
-        response.writeHead(200, { 'Content-Type': 'application/json' });
-        response.end(JSON.stringify({
-            status: 'running',
-            version: 'v8.1',
-            timestamp: new Date().toISOString(),
-            endpoints: Object.keys(this.routes)
-        }));
-    }
-
-    handlePrompt(request, response, url) {
-        if (request.method !== 'POST') {
-            response.writeHead(405, { 'Content-Type': 'application/json' });
-            response.end(JSON.stringify({ error: 'Method not allowed' }));
-            return;
-        }
-
-        let body = '';
-        request.on('data', chunk => {
-            body += chunk.toString();
-        });
-
-        request.on('end', () => {
-            try {
-                const data = JSON.parse(body);
-                const prompt = data.prompt;
-                
-                if (!prompt) {
-                    response.writeHead(400, { 'Content-Type': 'application/json' });
-                    response.end(JSON.stringify({ error: 'Missing prompt parameter' }));
-                    return;
-                }
-
-                console.log(`Processing prompt: ${prompt.substring(0, 100)}...`);
-
-                // Set SSE headers
-                response.writeHead(200, {
-                    'Content-Type': 'text/event-stream',
-                    'Cache-Control': 'no-cache',
-                    'Connection': 'keep-alive'
-                });
-
-                this.streamAIResponse(prompt, response);
-
-            } catch (error) {
-                console.error('Error parsing JSON:', error);
-                response.writeHead(400, { 'Content-Type': 'application/json' });
-                response.end(JSON.stringify({ error: 'Invalid JSON' }));
-            }
-        });
-    }
-
-    streamAIResponse(prompt, response) {
-        // Use the bash AI script we created
-        const aiScript = path.join(process.env.HOME, 'bin', 'ai');
-        
-        if (!fs.existsSync(aiScript)) {
-            this.sendSSEError(response, 'AI script not found. Please install it first.');
-            return;
-        }
-
-        const child = spawn(aiScript, [prompt], {
-            stdio: ['pipe', 'pipe', 'pipe']
-        });
-
-        // Stream output as SSE
-        child.stdout.on('data', (data) => {
-            const lines = data.toString().split('\n');
-            lines.forEach(line => {
-                if (line.trim()) {
-                    response.write(`data: ${JSON.stringify({ type: 'output', content: line })}\n\n`);
-                }
-            });
-        });
-
-        child.stderr.on('data', (data) => {
-            response.write(`data: ${JSON.stringify({ type: 'error', content: data.toString() })}\n\n`);
-        });
-
-        child.on('close', (code) => {
-            response.write(`data: ${JSON.stringify({ type: 'complete', code: code })}\n\n`);
-            response.end();
-        });
-
-        child.on('error', (error) => {
-            this.sendSSEError(response, `Process error: ${error.message}`);
-        });
-
-        // Handle client disconnect
-        response.on('close', () => {
-            if (!child.killed) {
-                child.kill();
-            }
-        });
-    }
-
-    sendSSEError(response, message) {
-        response.write(`data: ${JSON.stringify({ type: 'error', content: message })}\n\n`);
-        response.end();
-    }
-
-    handleMemory(request, response, url) {
-        const searchParams = url.searchParams;
-        const query = searchParams.get('q');
-        const limit = searchParams.get('limit') || 5;
-
-        if (!query) {
-            response.writeHead(400, { 'Content-Type': 'application/json' });
-            response.end(JSON.stringify({ error: 'Missing query parameter' }));
-            return;
-        }
-
-        // Simulate memory search - in reality, you'd query your SQLite database
-        response.writeHead(200, { 'Content-Type': 'application/json' });
-        response.end(JSON.stringify({
-            query: query,
-            limit: limit,
-            results: []
-        }));
-    }
-
-    handleConfig(request, response, url) {
-        if (request.method === 'GET') {
-            const searchParams = url.searchParams;
-            const key = searchParams.get('key');
-            
-            response.writeHead(200, { 'Content-Type': 'application/json' });
-            response.end(JSON.stringify({
-                action: 'get',
-                key: key,
-                value: null // Would come from your config system
-            }));
-        } else {
-            response.writeHead(405, { 'Content-Type': 'application/json' });
-            response.end(JSON.stringify({ error: 'Method not allowed' }));
-        }
-    }
-
-    handleNotFound(response) {
-        response.writeHead(404, { 'Content-Type': 'application/json' });
-        response.end(JSON.stringify({ 
-            error: 'Endpoint not found',
-            available_endpoints: Object.keys(this.routes)
-        }));
-    }
-
-    start() {
-        this.server.listen(this.port, () => {
-            console.log(`Triumvirate JSON SSE server at http://localhost:${this.port}/`);
-            console.log('Available endpoints:');
-            Object.keys(this.routes).forEach(endpoint => {
-                console.log(`  http://localhost:${this.port}${endpoint}`);
-            });
-        });
-
-        this.server.on('error', (error) => {
-            console.error('Server error:', error);
-            if (error.code === 'EADDRINUSE') {
-                console.log(`Port ${this.port} is already in use. Trying ${this.port + 1}...`);
-                this.port += 1;
-                this.start();
-            }
-        });
-    }
+function workerFromLine(line) {
+  if (line.includes("WORKER: MESSENGER")) return "Messenger";
+  if (line.includes("WORKER: COMBINATOR")) return "Combinator";
+  if (line.includes("WORKER: TRADER")) return "Trader";
+  if (line.includes("WORKER: SYSTEM")) return "System";
+  return null;
 }
 
-// Start the server
-const server = new TriumvirateServer(8080);
-server.start();
+const server = http.createServer((req, res) => {
+  const parsedUrl = url.parse(req.url, true);
 
-// Graceful shutdown
-process.on('SIGINT', () => {
-    console.log('\nShutting down server gracefully...');
-    process.exit(0);
+  if (parsedUrl.pathname === "/ai") {
+    const userPrompt = parsedUrl.query.prompt || "";
+    if (!userPrompt) {
+      res.writeHead(400, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "missing ?prompt=" }));
+      return;
+    }
+
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+    });
+
+    const aiProc = spawn(AI_BIN, [userPrompt], {
+      env: { ...process.env, PATH: process.env.PATH },
+    });
+
+    let currentWorker = "System";
+    let inFinalAnswer = false;
+
+    function sendEvent(eventObj) {
+      res.write(`data: ${JSON.stringify(eventObj)}\n\n`);
+    }
+
+    aiProc.stdout.on("data", (data) => {
+      data.toString().split(/\r?\n/).forEach((line) => {
+        if (!line.trim()) return;
+
+        // Detect final answer
+        if (line.includes("[FINAL_ANSWER]")) {
+          inFinalAnswer = true;
+        }
+
+        const detected = workerFromLine(line);
+        if (detected) currentWorker = detected;
+
+        sendEvent({
+          timestamp: new Date().toISOString(),
+          worker: currentWorker,
+          final: inFinalAnswer,
+          msg: line,
+        });
+      });
+    });
+
+    aiProc.stderr.on("data", (data) => {
+      data.toString().split(/\r?\n/).forEach((line) => {
+        if (!line.trim()) return;
+        sendEvent({
+          timestamp: new Date().toISOString(),
+          worker: "Error",
+          final: false,
+          msg: line,
+        });
+      });
+    });
+
+    aiProc.on("close", (code) => {
+      sendEvent({
+        timestamp: new Date().toISOString(),
+        worker: "System",
+        final: false,
+        msg: `Triumvirate finished with code ${code}`,
+      });
+      res.end();
+    });
+  }
+
+  else if (parsedUrl.pathname === "/" || parsedUrl.pathname === "/index.html") {
+    res.writeHead(200, { "Content-Type": "text/html" });
+    res.end(`
+<!doctype html>
+<html>
+<head>
+  <title>Triumvirate Agent Live JSON</title>
+  <style>
+    body { font-family: monospace; background:#111; color:#eee; }
+    .logbox { padding:6px; margin:4px 0; border:1px solid #444; white-space:pre-wrap; max-height:200px; overflow-y:auto; }
+    #Messenger{background:#202b33;color:#9cf;}
+    #Combinator{background:#1a1a2e;color:#c9f;}
+    #Trader{background:#2e1a1a;color:#fc9;}
+    #System{background:#1f1f1f;color:#aaa;}
+    #Error{background:#330000;color:#f66;}
+    #FinalAnswer{background:#003300;color:#9f9;font-weight:bold;}
+  </style>
+</head>
+<body>
+<h1>Triumvirate Mind (Structured JSON UI)</h1>
+<form onsubmit="launch(event)">
+<input type="text" id="prompt" size="60" placeholder="Enter request" />
+<button type="submit">Run</button>
+</form>
+
+<div id="System" class="logbox"></div>
+<div id="Messenger" class="logbox"></div>
+<div id="Combinator" class="logbox"></div>
+<div id="Trader" class="logbox"></div>
+<div id="Error" class="logbox"></div>
+<div id="FinalAnswer" class="logbox"></div>
+<button onclick="downloadFinal()">⬇️ Download Final Answer</button>
+
+<script>
+function appendLog(id, msg) {
+  const box = document.getElementById(id);
+  box.innerText += msg + "\\n";
+  box.scrollTop = box.scrollHeight;
+}
+
+function launch(e) {
+  e.preventDefault();
+  ["System","Messenger","Combinator","Trader","Error","FinalAnswer"].forEach(id=>document.getElementById(id).innerText="");
+  const prompt=document.getElementById("prompt").value;
+  const evt=new EventSource("/ai?prompt="+encodeURIComponent(prompt));
+
+  evt.onmessage=(e)=>{
+    const obj=JSON.parse(e.data);
+    const target=obj.final ? "FinalAnswer" : obj.worker;
+    appendLog(target,obj.timestamp+": "+obj.msg);
+  };
+}
+
+function downloadFinal() {
+  const text=document.getElementById("FinalAnswer").innerText.trim();
+  if(!text){alert("No Final Answer yet!"); return;}
+  const blob=new Blob([text],{type:"text/plain"});
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement("a");
+  a.href=url;
+  a.download="final_answer.txt";
+  a.click();
+  URL.revokeObjectURL(url);
+}
+</script>
+</body>
+</html>`);
+  }
+
+  else {
+    res.writeHead(404,{ "Content-Type": "text/plain"});
+    res.end("404 Not Found");
+  }
 });
 
-process.on('SIGTERM', () => {
-    console.log('Received SIGTERM, shutting down...');
-    process.exit(0);
-});
+server.listen(PORT,()=>console.log(`Triumvirate JSON SSE server at http://localhost:${PORT}/`));

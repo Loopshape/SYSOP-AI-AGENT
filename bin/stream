@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# ~/bin/stream - Full AI Token Streaming, Pool, Hash & Seed Tracking
+set -euo pipefail
+IFS=$'\n\t'
+
+# -------------------- CONFIG --------------------
+AI_HOME="${AI_HOME:-$HOME/.ai_agent}"
+EVENTS_DB="$AI_HOME/events.db"
+OLLAMA_BIN="$(command -v ollama || true)"
+AI_TEMPERATURE="${AI_TEMPERATURE:-0.7}"
+AI_TOP_P="${AI_TOP_P:-0.9}"
+AI_SEED="${AI_SEED:-}"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+
+log() { printf "${BLUE}[%s][STREAM]${NC} %s\n" "$(date '+%T')" "$*"; }
+log_success() { log "${GREEN}$*${NC}"; }
+log_warn() { log "${YELLOW}WARN: $*${NC}"; }
+log_error() { log "${RED}ERROR: $*${NC}"; exit 1; }
+
+sqlite_escape() { echo "$1" | sed "s/'/''/g"; }
+
+# -------------------- DB / EVENT --------------------
+add_event_to_db() {
+    local event_data="$1"
+    local task_id="${2:-}"
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    local event_hash=$(echo -n "$event_data" | sha256sum | cut -c1-64)
+    sqlite3 "$EVENTS_DB" "INSERT OR IGNORE INTO events (timestamp,event_hash,event_data,interest_score) VALUES ('$(sqlite_escape "$timestamp")','$(sqlite_escape "$event_hash")','$(sqlite_escape "$event_data")',0);" >/dev/null
+    echo "$event_hash"
+}
+
+compute_interest_score() {
+    local event_hash="$1"
+    local freq=$(sqlite3 "$EVENTS_DB" "SELECT COUNT(*) FROM events WHERE event_data LIKE (SELECT event_data FROM events WHERE event_hash='$event_hash');")
+    local score=$(awk -v f="$freq" 'BEGIN{min=0.1; max=1.0; s=max-(f-1)*(max-min)/100; if(s<min)s=min; print s}')
+    sqlite3 "$EVENTS_DB" "UPDATE events SET interest_score=$score WHERE event_hash='$event_hash';"
+}
+
+track_pool() {
+    local content="$1"
+    local seed="${2:-$AI_SEED}"
+    local loop_weight="${3:-0.1}"
+    local hash
+    hash=$(echo -n "$content$seed" | sha256sum | cut -c1-64)
+    add_event_to_db "POOL[$loop_weight]: $content" >/dev/null
+    sqlite3 "$EVENTS_DB" "UPDATE events SET interest_score=interest_score+$loop_weight WHERE event_hash='$hash';"
+    echo "$hash"
+}
+
+# -------------------- STREAMING --------------------
+stream_full_tokens() {
+    local model="$1"
+    local system_prompt="$2"
+    local conversation_history="$3"
+    local seed="${AI_SEED:-}"
+    local fifo=$(mktemp -u)
+    mkfifo "$fifo"
+
+    log_success "Starting token-level stream for model '$model'..."
+
+    (
+        AI_INTERNAL_CALL="true"
+        "$OLLAMA_BIN" run --verbose "$model" \
+            --temperature "$AI_TEMPERATURE" --top_p "$AI_TOP_P" \
+            ${seed:+--seed "$seed"} \
+            "$system_prompt"$'\n'"$conversation_history" 2>&1 > "$fifo"
+    ) &
+    local pid=$!
+
+    while IFS= read -r line <"$fifo"; do
+        [[ -z "$line" ]] && continue
+
+        if [[ "$line" =~ ^\>\>\> ]]; then
+            # Token-level verbose output
+            echo -e "${YELLOW}[TOKEN_VERBOSE] $line${NC}" >&2
+            track_pool "$line" "$seed" 0.1 >/dev/null
+        elif [[ "$line" =~ ^\{.*\}$ ]]; then
+            token=$(echo "$line" | jq -r '.response? // empty')
+            done_status=$(echo "$line" | jq -r '.done? // false')
+            [[ -n "$token" ]] && printf '%s' "$token"
+            [[ "$done_status" == "true" ]] && printf '\n'
+            track_pool "$token" "$seed" 0.1 >/dev/null
+        else
+            echo -e "${BLUE}[STREAM] $line${NC}" >&2
+            track_pool "$line" "$seed" 0.1 >/dev/null
+        fi
+    done
+
+    wait "$pid" 2>/dev/null || true
+    rm -f "$fifo"
+    log_success "Token stream completed."
+}
+
+# -------------------- LOOP --------------------
+full_stream_loop() {
+    local model="$1"
+    local prompt="$2"
+    local loops="${3:-1}"
+    local context="$prompt"
+
+    for i in $(seq 1 "$loops"); do
+        log_info "Streaming AI loop $i/$loops"
+        stream_full_tokens "$model" "$prompt" "$context"
+        context+=" (loop reinforced $i)"
+    done
+}
+
+# -------------------- CLI --------------------
+show_help() {
+    echo -e "${GREEN}STREAM Utility - Token-level AI Streaming with Pool & Hash Tracking${NC}"
+    echo "Usage: stream <model> <prompt> [loops]"
+    echo ""
+    echo "Arguments:"
+    echo "  model     - AI model to run (messenger/combinator/trader/codegen)"
+    echo "  prompt    - System/user prompt"
+    echo "  loops     - Optional, number of reinforcement loops (default: 1)"
+}
+
+main() {
+    [[ $# -lt 2 ]] && show_help && exit 0
+    local model="$1"; shift
+    local prompt="$1"; shift
+    local loops="${1:-1}"
+    full_stream_loop "$model" "$prompt" "$loops"
+}
+
+main "$@"

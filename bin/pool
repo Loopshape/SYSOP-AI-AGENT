@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+# pool - dechiffre tool
+# Usage: pool [string]
+# If no argument is given, reads from stdin.
+
+import sys
+import base64
+import hashlib
+from binascii import hexlify, unhexlify
+
+B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+def is_hex(s):
+    try:
+        bytes.fromhex(s)
+        return True
+    except Exception:
+        return False
+
+def is_base64(s):
+    try:
+        # allow both padded and unpadded variants by trying decode
+        base64.b64decode(s + '=' * (-len(s) % 4), validate=True)
+        return True
+    except Exception:
+        return False
+
+def base58_to_bytes(s):
+    num = 0
+    for ch in s:
+        idx = B58_ALPHABET.find(ch)
+        if idx == -1:
+            raise ValueError("Not Base58")
+        num = num * 58 + idx
+    # convert int to bytes
+    b = num.to_bytes((num.bit_length() + 7) // 8, 'big') if num != 0 else b''
+    # restore leading zeros (Base58 '1' => 0x00)
+    n_pad = 0
+    for ch in s:
+        if ch == '1':
+            n_pad += 1
+        else:
+            break
+    return b'\x00' * n_pad + b
+
+def double_sha256(b):
+    return hashlib.sha256(hashlib.sha256(b).digest()).digest()
+
+def try_base58check(s):
+    try:
+        raw = base58_to_bytes(s)
+    except Exception:
+        return None
+    if len(raw) < 5:
+        return {'valid': False, 'reason': 'too short for Base58Check', 'raw_hex': hexlify(raw).decode()}
+    payload, checksum = raw[:-4], raw[-4:]
+    calc = double_sha256(payload)[:4]
+    return {
+        'valid': calc == checksum,
+        'version': payload[0] if len(payload)>=1 else None,
+        'payload_hex': hexlify(payload[1:]).decode() if len(payload) > 1 else '',
+        'raw_hex': hexlify(raw).decode(),
+        'checksum_hex': hexlify(checksum).decode(),
+        'calc_checksum_hex': hexlify(calc).decode(),
+    }
+
+def guess_btc_type(version):
+    if version is None:
+        return None
+    if version == 0x00:
+        return "P2PKH address (BTC mainnet)"
+    if version == 0x05:
+        return "P2SH address (BTC mainnet)"
+    if version == 0x6f:
+        return "P2PKH address (BTC testnet)"
+    if version == 0xc4:
+        return "P2SH address (BTC testnet)"
+    if version == 0x80:
+        return "WIF private key (BTC mainnet)"
+    if version == 0xef:
+        return "WIF private key (BTC testnet)"
+    return f"unknown (version 0x{version:02x})"
+
+def try_hex(s):
+    try:
+        b = bytes.fromhex(s)
+        return {'bytes_len': len(b), 'hex': hexlify(b).decode()}
+    except Exception:
+        return None
+
+def try_base64(s):
+    try:
+        b = base64.b64decode(s + '=' * (-len(s) % 4), validate=True)
+        return {'bytes_len': len(b), 'hex': hexlify(b).decode()}
+    except Exception:
+        return None
+
+def sha256_hex_of(s):
+    return hashlib.sha256(s.encode() if isinstance(s,str) else s).hexdigest()
+
+def main():
+    if len(sys.argv) >= 2:
+        s = sys.argv[1]
+    else:
+        s = sys.stdin.read().strip()
+    if not s:
+        print("Usage: pool [string]   (or pipe input)")
+        sys.exit(1)
+
+    print("Input:", s)
+    print("-" * 60)
+
+    # quick checks
+    print("Length:", len(s))
+    print("Alphabet checks:")
+    print("  Looks like hex?:", is_hex(s))
+    print("  Looks like base64?:", is_base64(s))
+    b58_ok = all(ch in B58_ALPHABET for ch in s)
+    print("  Looks like base58?:", b58_ok)
+
+    print("\n--- Hex test ---")
+    h = try_hex(s)
+    if h:
+        print("Hex decoded (len bytes):", h['bytes_len'])
+        print("Hex:", h['hex'])
+        print("SHA256(hex bytes):", hashlib.sha256(bytes.fromhex(h['hex'])).hexdigest())
+    else:
+        print("Not valid hex")
+
+    print("\n--- Base64 test ---")
+    b64 = try_base64(s)
+    if b64:
+        print("Base64 decoded (len bytes):", b64['bytes_len'])
+        print("Hex:", b64['hex'])
+        print("SHA256(base64 bytes):", hashlib.sha256(bytes.fromhex(b64['hex'])).hexdigest())
+    else:
+        print("Not valid base64")
+
+    print("\n--- Base58 / Base58Check test ---")
+    try:
+        b = base58_to_bytes(s)
+        print("Base58 decode length:", len(b))
+        print("Base58 -> hex:", hexlify(b).decode())
+        b58check = try_base58check(s)
+        if b58check:
+            print("Base58Check analysis:")
+            print("  Raw hex:", b58check['raw_hex'])
+            print("  Version byte:", b58check['version'], "->", guess_btc_type(b58check['version']))
+            print("  Payload hex:", b58check['payload_hex'])
+            print("  Checksum hex:", b58check['checksum_hex'])
+            print("  Calculated checksum:", b58check['calc_checksum_hex'])
+            print("  Checksum valid?:", b58check['valid'])
+        else:
+            print("Base58 decode OK, but Base58Check analysis failed (too short).")
+    except Exception as e:
+        print("Not valid Base58 (error):", str(e))
+
+    print("\n--- Extra guesses ---")
+    # Try SHA256 of input text
+    print("SHA256(input as text):", sha256_hex_of(s))
+    # Try SHA256 of raw bytes if it decodes as hex/base64/base58
+    if h:
+        print("SHA256(hex bytes):", hashlib.sha256(bytes.fromhex(h['hex'])).hexdigest())
+    if b64:
+        print("SHA256(base64 bytes):", hashlib.sha256(bytes.fromhex(b64['hex'])).hexdigest())
+
+    print("\nNotes:")
+    print("- If this is a private key / seed: do NOT paste in public places. Treat as compromised now.")
+    print("- If you want additional tries (multibase, bech32, other coin formats), tell me which ones and I can extend this tool.")
+    print("- Saved this run? Re-run with 'pool <string>' or echo '<string>' | pool")
+
+if __name__ == '__main__':
+    main()

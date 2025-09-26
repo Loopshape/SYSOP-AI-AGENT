@@ -1,0 +1,262 @@
+#!/usr/bin/env bash
+# ai_task_manager.sh - Full online file assembly + token-aware AI task manager
+# Version 2.0 - With context assembly and token counting
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# Configuration
+DB="$HOME/.ai_task_manager.db"
+VERBOSE=${VERBOSE:-1}
+# Set a token limit. Using word count as a proxy for tokens.
+# A common large context is 32k tokens; we'll use words as a conservative estimate.
+TOKEN_LIMIT=${TOKEN_LIMIT:-8000}
+
+### ───────────────────────────
+### Logging & Utilities
+### ───────────────────────────
+log(){ [[ "$VERBOSE" -ge "$1" ]] && shift && echo "[*] $*"; }
+error(){ echo "[!] $*" >&2; exit 1; }
+
+sql_escape(){ echo "$1" | sed "s/'/''/g"; }
+run_sql(){ sqlite3 "$DB" "$1"; }
+sha256_file(){ sha256sum "$1" | awk '{print $1}'; }
+
+# New: Function to count "tokens" (words) from stdin
+count_tokens() {
+    wc -w | tr -d ' '
+}
+
+### ───────────────────────────
+### DB Init
+### ───────────────────────────
+init_db(){
+    if [[ ! -f "$DB" ]]; then
+        log 1 "Initializing DB at $DB"
+        sqlite3 "$DB" <<'SQL'
+CREATE TABLE projects (
+    hash TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    path TEXT NOT NULL,
+    ts DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE file_hashes (
+    project_hash TEXT,
+    file_path TEXT,
+    file_hash TEXT,
+    rehashed INTEGER DEFAULT 0,
+    PRIMARY KEY(project_hash,file_path)
+);
+CREATE TABLE events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+    type TEXT,
+    data TEXT
+);
+SQL
+    fi
+}
+
+### ───────────────────────────
+### Project Operations
+### ───────────────────────────
+
+# New: List ingested projects for better usability
+list_projects(){
+    log 1 "Ingested Projects:"
+    run_sql "SELECT printf('%-20s %-40s %s', name, hash, path) FROM projects;"
+}
+
+# Modified: Added a 'name' for easier reference
+ingest_repo(){
+    local repo_path="$1"
+    [[ -d "$repo_path" ]] || error "Repo not found: $repo_path"
+    local repo_name
+    repo_name=$(basename "$repo_path")
+    local hash
+    hash=$(echo -n "$repo_path" | sha256sum | awk '{print $1}')
+    run_sql "INSERT OR IGNORE INTO projects(hash,name,path) VALUES('$(sql_escape "$hash")','$(sql_escape "$repo_name")','$(sql_escape "$repo_path")');"
+
+    find "$repo_path" -type f | while read -r f; do
+        local fh
+        fh=$(sha256_file "$f")
+        run_sql "INSERT OR REPLACE INTO file_hashes(project_hash,file_path,file_hash) VALUES('$(sql_escape "$hash")','$(sql_escape "$f")','$fh');"
+    done
+    log 1 "Repo '$repo_name' ingested: $repo_path -> $hash"
+    echo "$hash"
+}
+
+# New: Function to get changed files for a project
+get_changed_files(){
+    local repo_hash="$1"
+    local base
+    base=$(run_sql "SELECT path FROM projects WHERE hash='$(sql_escape "$repo_hash")' OR name='$(sql_escape "$repo_hash")' LIMIT 1;")
+    [[ -z "$base" ]] && error "No project found for '$repo_hash'"
+
+    find "$base" -type f | while read -r f; do
+        local newh
+        newh=$(sha256_file "$f")
+        local oldh
+        oldh=$(run_sql "SELECT file_hash FROM file_hashes WHERE project_hash=(SELECT hash FROM projects WHERE path='$(sql_escape "$base")') AND file_path='$(sql_escape "$f")';")
+
+        if [[ "$newh" != "$oldh" ]]; then
+            echo "$f"
+        fi
+    done
+}
+
+# New: Command to explicitly show changed files
+project_status(){
+    local repo_hash="$1"
+    log 1 "Checking status for project '$repo_hash'..."
+    get_changed_files "$repo_hash" | sed 's/^/M /' || log 1 "No changes detected."
+}
+
+rehash_repo_files(){
+    local repo_hash="$1"; shift
+    local mode="set" tag="" reloop=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --set) mode="set"; shift ;;
+            --del) mode="del"; shift ;;
+            --fix) mode="fix"; shift ;;
+            --nop) mode="nop"; shift ;;
+            --tag) tag="$2"; shift 2 ;;
+            --reloop) reloop=1; shift ;;
+            *) break ;;
+        esac
+    done
+
+    local base
+    base=$(run_sql "SELECT path FROM projects WHERE hash='$(sql_escape "$repo_hash")' OR name='$(sql_escape "$repo_hash")' LIMIT 1;")
+    [[ -z "$base" ]] && error "No project path for $repo_hash"
+    # Resolve the actual hash if a name was used
+    repo_hash=$(run_sql "SELECT hash FROM projects WHERE path='$(sql_escape "$base")' LIMIT 1;")
+
+
+    log 1 "Rehashing $base [mode=$mode tag=$tag reloop=$reloop]"
+
+    local again=1
+    while [[ $again -eq 1 ]]; do
+        again=0
+        get_changed_files "$repo_hash" | while read -r f; do
+            local newh
+            newh=$(sha256_file "$f")
+            case "$mode" in
+                set) run_sql "INSERT OR REPLACE INTO file_hashes(project_hash,file_path,file_hash,rehashed) VALUES('$(sql_escape "$repo_hash")','$(sql_escape "$f")','$newh',1);" ;;
+                del) run_sql "DELETE FROM file_hashes WHERE project_hash='$(sql_escape "$repo_hash")' AND file_path='$(sql_escape "$f")';" ;;
+                fix) touch "$f"; run_sql "UPDATE file_hashes SET rehashed=1 WHERE project_hash='$(sql_escape "$repo_hash")' AND file_path='$(sql_escape "$f")';" ;;
+                nop) log 1 "NOP mismatch: $f" ;;
+            esac
+            log 1 "Change detected ($mode): $f"
+            [[ -n "$tag" ]] && run_sql "INSERT INTO events(type,data) VALUES('tag','$(sql_escape "$tag:$f")');"
+            [[ $reloop -eq 1 ]] && again=1
+        done
+    done
+    log 1 "Rehash completed for $repo_hash"
+}
+
+### ───────────────────────────
+### AI Task Integration
+### ───────────────────────────
+
+# New: Assemble a context from changed files
+assemble_context(){
+    local repo_hash="$1"
+    get_changed_files "$repo_hash" | while read -r f; do
+        echo "--- START: $f ---"
+        cat "$f"
+        echo "--- END: $f ---"
+        echo ""
+    done
+}
+
+# Modified: Now token-aware and context-aware
+ai_task(){
+    local repo_hash="$1"; shift
+    local prompt="$*"
+    log 1 "Assembling context for AI task on project '$repo_hash'..."
+
+    local context
+    context=$(assemble_context "$repo_hash")
+
+    if [[ -z "$context" ]]; then
+        log 1 "No changed files to assemble for context. Use 'rehash' to commit changes if needed."
+        context="No changed files detected."
+    fi
+
+    local token_count
+    token_count=$(echo "$context" | count_tokens)
+
+    log 1 "Assembled context is $token_count words/tokens."
+    if (( token_count > TOKEN_LIMIT )); then
+        error "Context size ($token_count) exceeds token limit ($TOKEN_LIMIT). Please commit changes with 'rehash' or narrow your scope."
+    fi
+
+    local full_prompt
+    full_prompt="CONTEXT:
+${context}
+---
+PROMPT:
+${prompt}"
+
+    log 1 "AI task logged. Sending to AI model (placeholder)..."
+    run_sql "INSERT INTO events(type,data) VALUES('ai','$(sql_escape "$full_prompt")');"
+
+    # Placeholder: integrate token-based AI call
+    # Example:
+    # my_ai_tool --prompt "$full_prompt"
+    echo "───────────────────────────"
+    echo "Full prompt for AI:"
+    echo "$full_prompt"
+    echo "───────────────────────────"
+}
+
+qbit_task(){
+    local args="$*"
+    log 1 "QBit task: $args"
+    run_sql "INSERT INTO events(type,data) VALUES('qbit','$(sql_escape "$args")');"
+}
+
+### ───────────────────────────
+### CLI Dispatch
+### ───────────────────────────
+show_help(){
+    cat <<EOF
+Usage: $0 <command> [args...]
+
+A token-aware AI task manager for local code repositories.
+
+Commands:
+  ingest <path>             Ingest project, giving it a name based on the directory.
+  list                      List all ingested projects.
+  status <name|hash>        Show modified files in a project.
+  rehash <name|hash> [flags] Update file hashes for a project to the current state.
+                            Effectively commits the changes.
+  ai <name|hash> <prompt...> Run AI task with changed files as context.
+
+Flags for rehash:
+  --set (default) Update the hash of changed files.
+  --del           Delete records of changed files.
+  --tag <tag>     Log an event when a file is changed.
+EOF
+}
+
+main(){
+    [[ $# -lt 1 ]] && { show_help; exit 1; }
+    local cmd="$1"; shift
+    init_db
+    case "$cmd" in
+        ingest) ingest_repo "$@" ;;
+        rehash) rehash_repo_files "$@" ;;
+        list) list_projects ;;
+        status) project_status "$@" ;;
+        ai) ai_task "$@" ;;
+        qbit) qbit_task "$@" ;;
+        help|--help|-h) show_help ;;
+        *) error "Unknown command: $cmd" ;;
+    esac
+}
+
+main "$@"

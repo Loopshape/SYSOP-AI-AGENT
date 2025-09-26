@@ -1,0 +1,58 @@
+#!/bin/env node
+// filename: conceptFlow.mjs or package.json: "type": "module"
+import crypto from 'crypto';
+
+class ConceptFlow {
+    constructor(concepts, offset) {
+        this.concepts = concepts;
+        this.offset = offset;
+        this.y = crypto.createHash('sha256').update(offset).digest('hex');
+        console.log(`initial y = ${this.y}`);
+    }
+
+    bip39() {
+        this.y = crypto.randomBytes(16).toString('hex');
+        return this;
+    }
+
+    base58() {
+        const alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+        let intVal = BigInt('0x' + this.y);
+        let encoded = '';
+        while (intVal > 0n) {
+            let mod = intVal % 58n;
+            encoded = alphabet[Number(mod)] + encoded;
+            intVal = intVal / 58n;
+        }
+        this.y = encoded || '1';
+        return this;
+    }
+
+    sha256() {
+        this.y = crypto.createHash('sha256').update(this.y).digest('hex');
+        return this;
+    }
+
+    wpa2() {
+        if (/^[0-9a-f]+$/i.test(this.y)) {
+            return this.base58();
+        } else {
+            return this.sha256();
+        }
+    }
+
+    processAll() {
+        for (let concept of this.concepts) {
+            this.bip39().wpa2();
+            console.log(`${concept} -> y = ${this.y}`);
+        }
+        console.log('final y =', this.y);
+        return this;
+    }
+}
+
+const concepts = ["Love","Focus","Rude","Charge","Heavy","Uniform","Unit","Space","Way","Sign","Install","World"];
+const offsetString = "1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa";
+
+const flow = new ConceptFlow(concepts, offsetString);
+flow.processAll();
