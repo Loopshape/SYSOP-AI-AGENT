@@ -1,4 +1,5 @@
 <!DOCTYPE html>
+<<<<<<< HEAD
 <html lang="en">
 <head>
     <meta charset="UTF-8">
@@ -174,3 +175,299 @@
     <script type="module" src="index.tsx"></script>
 </body>
 </html>
+=======
+<html>
+  <head>
+    <title>AI DevOps Assistant</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link
+      rel="stylesheet"
+      href="https://esm.sh/highlight.js/styles/atom-one-dark.css"
+    />
+    <link rel="stylesheet" href="index.css" />
+    <script type="importmap">
+      {
+        "imports": {
+          "marked": "https://esm.sh/marked@^15.0.8",
+          "@google/genai": "https://esm.sh/@google/genai",
+          "highlight.js": "https://esm.sh/highlight.js"
+        }
+      }
+    </script>
+    <script type="module" src="index.tsx"></script>
+  </head>
+  <body>
+    <!-- Settings Modal -->
+    <div id="settings-modal" class="modal-overlay" hidden>
+      <div class="modal-content">
+        <button id="close-modal-button" aria-label="Close settings">&times;</button>
+        <h2>System Instruction</h2>
+        <p>Define the AI's role, personality, and instructions. This will start a new chat session.</p>
+        <form id="system-instruction-form">
+          <textarea id="system-instruction-input" rows="5" placeholder="e.g., You are a helpful pirate assistant."></textarea>
+          
+          <div class="setting-item">
+            <label for="web-search-toggle">Enable Web Search</label>
+            <div class="toggle-switch">
+              <input type="checkbox" id="web-search-toggle" aria-describedby="web-search-description" />
+              <span class="slider round"></span>
+            </div>
+          </div>
+          <p id="web-search-description" class="setting-description">
+            Grounds AI responses with Google Search for up-to-date information. Sources will be displayed. This will start a new chat session.
+          </p>
+
+          <button type="submit">Apply Settings &amp; Start New Chat</button>
+        </form>
+        <div class="history-container">
+            <h3>History</h3>
+            <button id="clear-history-button">Clear</button>
+        </div>
+        <div id="instruction-history">
+            <!-- History items will be populated here -->
+        </div>
+      </div>
+    </div>
+
+    <!-- CI/CD Helper Modal -->
+    <div id="cicd-modal" class="modal-overlay" hidden>
+        <div class="modal-content">
+            <button id="close-cicd-modal-button" aria-label="Close CI/CD Helper">&times;</button>
+            <h2>CI/CD Pipeline Helper</h2>
+            <div class="tab-container">
+                <button class="tab-button active" data-tab="analyze-tab-content">Analyze Existing</button>
+                <button class="tab-button" data-tab="generate-tab-content">Generate New</button>
+                <button class="tab-button" data-tab="dockerfile-tab-content">Generate Dockerfile</button>
+                <button class="tab-button" data-tab="k8s-tab-content">Generate K8s</button>
+                <button class="tab-button" data-tab="git-tab-content">Git Helper</button>
+            </div>
+
+            <!-- Analyze Tab Content -->
+            <div id="analyze-tab-content" class="tab-content active">
+                <form id="analyze-pipeline-form">
+                    <p class="modal-description">Paste your full pipeline configuration file content below (e.g., .github/workflows/main.yml).</p>
+                    <textarea id="pipeline-input" rows="10" placeholder="Paste your CI/CD YAML here..." required></textarea>
+                    <button type="submit">Analyze Pipeline</button>
+                </form>
+                <div id="analyze-result" class="cicd-result-container"></div>
+            </div>
+
+            <!-- Generate Tab Content -->
+            <div id="generate-tab-content" class="tab-content">
+                <form id="generate-pipeline-form">
+                    <p class="modal-description">Describe your project, and the assistant will generate a pipeline configuration for you.</p>
+                    <label for="pipeline-template-select">Load a Template</label>
+                    <select id="pipeline-template-select">
+                        <option value="">-- Select a template --</option>
+                        <option value="node-build-test">Node.js (Build & Test)</option>
+                        <option value="python-lint-test">Python (Lint & Test)</option>
+                        <option value="docker-build-push">Docker Build & Push to GHCR</option>
+                    </select>
+
+                    <label for="pipeline-platform">Platform</label>
+                    <select id="pipeline-platform">
+                        <option value="GitHub Actions">GitHub Actions</option>
+                        <option value="GitLab CI/CD">GitLab CI/CD</option>
+                        <option value="Jenkinsfile">Jenkinsfile</option>
+                        <option value="CircleCI">CircleCI</option>
+                    </select>
+
+                    <label>Pipeline Triggers</label>
+                    <div class="checkbox-group">
+                        <div>
+                            <input type="checkbox" id="trigger-push" name="pipeline-triggers" value="on push to main branch" checked>
+                            <label for="trigger-push">On push to main branch</label>
+                        </div>
+                        <div>
+                            <input type="checkbox" id="trigger-pr" name="pipeline-triggers" value="on pull request">
+                            <label for="trigger-pr">On pull request</label>
+                        </div>
+                        <div>
+                            <input type="checkbox" id="trigger-schedule" name="pipeline-triggers" value="on a schedule (e.g., daily)">
+                            <label for="trigger-schedule">On a schedule (e.g., daily)</label>
+                        </div>
+                    </div>
+
+                    <label for="project-language">Language / Framework</label>
+                    <input type="text" id="project-language" placeholder="e.g., Node.js, Python, Docker" required>
+                    <label for="build-command">Build Command</label>
+                    <input type="text" id="build-command" placeholder="e.g., npm run build">
+                    <label for="test-command">Test Command</label>
+                    <input type="text" id="test-command" placeholder="e.g., npm test">
+                    <label for="additional-requirements">Additional Requirements</label>
+                    <textarea id="additional-requirements" rows="3" placeholder="e.g., Deploy to AWS S3, use specific node version..."></textarea>
+                    <button type="submit">Generate Pipeline</button>
+                </form>
+                <div id="generate-result" class="cicd-result-container"></div>
+            </div>
+
+            <!-- Generate Dockerfile Tab Content -->
+            <div id="dockerfile-tab-content" class="tab-content">
+                <form id="generate-dockerfile-form">
+                    <p class="modal-description">Provide details about your application to generate a production-ready Dockerfile.</p>
+                    <label for="dockerfile-template-select">Load a Template</label>
+                    <select id="dockerfile-template-select">
+                        <option value="">-- Select a template --</option>
+                        <option value="node-prod">Node.js (Production)</option>
+                        <option value="python-flask">Python (Flask/Gunicorn)</option>
+                        <option value="go-static">Go (Static Binary)</option>
+                    </select>
+                    <label for="docker-language">Language / Framework</label>
+                    <input type="text" id="docker-language" placeholder="e.g., Node.js, Python, Go" required>
+                    <label for="docker-dependencies">Dependencies / Package Manager File</label>
+                    <input type="text" id="docker-dependencies" placeholder="e.g., package.json, requirements.txt" required>
+                    <label for="docker-port">Port to Expose</label>
+                    <input type="number" id="docker-port" placeholder="e.g., 8080">
+                    <label for="docker-build-command">Build Command (optional)</label>
+                    <input type="text" id="docker-build-command" placeholder="e.g., npm run build">
+                    <label for="docker-start-command">Start Command</label>
+                    <input type="text" id="docker-start-command" placeholder="e.g., node server.js" required>
+                    <label for="docker-requirements">Additional Requirements</label>
+                    <textarea id="docker-requirements" rows="3" placeholder="e.g., Use a specific base image, set ENV variables..."></textarea>
+                    <button type="submit">Generate Dockerfile</button>
+                </form>
+                <div id="dockerfile-result" class="cicd-result-container"></div>
+            </div>
+
+            <!-- Generate Kubernetes Tab Content -->
+            <div id="k8s-tab-content" class="tab-content">
+                <form id="generate-k8s-form">
+                    <p class="modal-description">Describe your application, and the assistant will generate Kubernetes manifest files for you.</p>
+                    <label for="k8s-template-select">Load a Template</label>
+                    <select id="k8s-template-select">
+                        <option value="">-- Select a template --</option>
+                        <option value="stateless-app">Stateless Web App (Deployment + Service)</option>
+                        <option value="stateful-app">Stateful App (StatefulSet + Headless Service)</option>
+                        <option value="cron-job">Cron Job</option>
+                    </select>
+            
+                    <label for="k8s-manifest-type">Manifest Type</label>
+                    <select id="k8s-manifest-type">
+                        <option value="Deployment + Service">Deployment + Service</option>
+                        <option value="Deployment">Deployment</option>
+                        <option value="Service">Service</option>
+                        <option value="StatefulSet">StatefulSet</option>
+                        <option value="ConfigMap">ConfigMap</option>
+                        <option value="Secret">Secret</option>
+                        <option value="CronJob">CronJob</option>
+                    </select>
+            
+                    <label for="app-name">Application Name</label>
+                    <input type="text" id="app-name" placeholder="e.g., my-web-app" required>
+            
+                    <label for="docker-image">Docker Image</label>
+                    <input type="text" id="docker-image" placeholder="e.g., nginx:latest" required>
+                    
+                    <label for="replicas">Number of Replicas</label>
+                    <input type="number" id="replicas" value="3" min="1">
+            
+                    <label for="container-port">Container Port</label>
+                    <input type="number" id="container-port" placeholder="e.g., 80">
+            
+                    <label for="service-type">Service Type</label>
+                    <select id="service-type">
+                        <option value="LoadBalancer">LoadBalancer</option>
+                        <option value="ClusterIP">ClusterIP</option>
+                        <option value="NodePort">NodePort</option>
+                    </select>
+            
+                    <label for="service-port">Service Port</label>
+                    <input type="number" id="service-port" placeholder="e.g., 80">
+                    
+                    <label for="target-port">Target Port (optional, defaults to Container Port)</label>
+                    <input type="number" id="target-port" placeholder="e.g., 8080">
+            
+                    <label for="k8s-requirements">Additional Requirements</label>
+                    <textarea id="k8s-requirements" rows="3" placeholder="e.g., Add resource limits, environment variables..."></textarea>
+                    <button type="submit">Generate Manifest</button>
+                </form>
+                <div id="k8s-result" class="cicd-result-container"></div>
+            </div>
+
+            <!-- Git Helper Tab Content -->
+            <div id="git-tab-content" class="tab-content">
+                <form id="git-helper-form" onsubmit="return false;">
+                    <p class="modal-description">Generate common Git commands and get an AI-powered explanation of how they work.</p>
+            
+                    <fieldset>
+                        <legend>Clone a Repository</legend>
+                        <label for="git-repo-url">Repository URL (HTTPS or SSH)</label>
+                        <input type="text" id="git-repo-url" placeholder="https://github.com/user/repo.git">
+                        <button type="button" id="generate-clone-btn">Generate Clone Command</button>
+                    </fieldset>
+            
+                    <fieldset>
+                        <legend>Commit Changes</legend>
+                        <label for="git-commit-message">Commit Message</label>
+                        <input type="text" id="git-commit-message" placeholder="feat: Add new feature">
+                        <div class="checkbox-group" style="margin-bottom: 1rem;">
+                            <div>
+                                <input type="checkbox" id="git-add-all" name="git-add-all" checked>
+                                <label for="git-add-all">Add all changes (`git add -A`)</label>
+                            </div>
+                        </div>
+                        <button type="button" id="generate-commit-btn">Generate Commit Command</button>
+                    </fieldset>
+            
+                    <fieldset>
+                        <legend>Create a Branch</legend>
+                        <label for="git-branch-name">New Branch Name</label>
+                        <input type="text" id="git-branch-name" placeholder="feature/new-design">
+                        <div class="checkbox-group" style="margin-bottom: 1rem;">
+                            <div>
+                                <input type="checkbox" id="git-checkout-branch" name="git-checkout-branch" checked>
+                                <label for="git-checkout-branch">Switch to the new branch (`-b`)</label>
+                            </div>
+                        </div>
+                        <button type="button" id="generate-branch-btn">Generate Branch Command</button>
+                    </fieldset>
+
+                    <fieldset>
+                        <legend>View History</legend>
+                        <label for="git-log-count">Number of commits to show (optional)</label>
+                        <input type="number" id="git-log-count" placeholder="e.g., 5">
+                        <button type="button" id="generate-log-btn">Generate Log Command</button>
+                    </fieldset>
+                    
+                </form>
+                <div id="git-result" class="cicd-result-container"></div>
+            </div>
+
+        </div>
+    </div>
+
+    <main id="app-container">
+      <header>
+        <span class="header-title">AI DevOps Assistant</span>
+        <div class="header-buttons">
+            <button id="cicd-helper-button" aria-label="Open CI/CD Helper">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M22.7 19l-9.1-9.1c.9-2.3.4-5-1.5-6.9-2-2-5-2.4-7.4-1.3L9 6 6 9 1.6 4.7C.4 7.1.9 10.1 2.9 12.1c1.9 1.9 4.6 2.4 6.9 1.5l9.1 9.1c.4.4 1 .4 1.4 0l2.3-2.3c.5-.4.5-1.1.1-1.4z"/></svg>
+            </button>
+            <button id="settings-button" aria-label="Open settings">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M19.43 12.98c.04-.32.07-.64.07-.98s-.03-.66-.07-.98l2.11-1.65c.19-.15.24-.42.12-.64l-2-3.46c-.12-.22-.39-.3-.61-.22l-2.49 1c-.52-.4-1.08-.73-1.69-.98l-.38-2.65C14.46 2.18 14.25 2 14 2h-4c-.25 0-.46.18-.49.42l-.38 2.65c-.61.25-1.17.59-1.69.98l-2.49-1c-.23-.09-.49 0-.61.22l-2 3.46c-.13.22-.07.49.12.64l2.11 1.65c-.04.32-.07.65-.07.98s.03.66.07.98l-2.11 1.65c-.19.15-.24.42-.12.64l2 3.46c.12.22.39.3.61.22l2.49-1c.52.4 1.08.73 1.69.98l.38 2.65c.03.24.24.42.49.42h4c.25 0 .46-.18.49.42l-.38-2.65c.61-.25 1.17-.59 1.69-.98l2.49 1c.23.09.49 0 .61.22l2-3.46c.12-.22.07-.49-.12-.64l-2.11-1.65zM12 15.5c-1.93 0-3.5-1.57-3.5-3.5s1.57-3.5 3.5-3.5 3.5 1.57 3.5 3.5-1.57 3.5-3.5 3.5z"/></svg>
+            </button>
+        </div>
+      </header>
+      <div id="output"></div>
+      <form id="prompt-form" aria-label="Chat input form">
+        <textarea
+          name="prompt"
+          id="prompt-input"
+          placeholder="Ask your AI DevOps assistant..."
+          aria-label="Enter your prompt"
+          rows="1"
+        ></textarea>
+        <button type="submit" aria-label="Send message">
+          <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="currentColor"
+          >
+            <path d="M2.01 21L23 12 2.01 3 2 10l15 2-15 2z" />
+          </svg>
+        </button>
+      </form>
+    </main>
+  </body>
+</html>
+>>>>>>> a82d405ed7b34abd96f3ee904fd03991111ba12e

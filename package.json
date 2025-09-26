@@ -20,9 +20,14 @@
     "jquery": "^3.7.1",
     "lodash": "^4.17.21",
     "marked": "^15.0.8",
+<<<<<<< HEAD
     "react": "^19.1.1",
     "react-dom": "^19.1.1",
     "sqlite3": "^5.1.7"
+=======
+    "@google/genai": "latest",
+    "highlight.js": "latest"
+>>>>>>> a82d405ed7b34abd96f3ee904fd03991111ba12e
   },
   "devDependencies": {
     "@types/node": "^22.14.0",
