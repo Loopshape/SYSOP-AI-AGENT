@@ -1,6 +1,4 @@
-<<<<<<< HEAD
 import { GoogleGenAI, GenerateContentResponse, Type } from "@google/genai";
-=======
 /**
  * @license
  * SPDX-License-Identifier: Apache-2.0
@@ -8,7 +6,6 @@ import { GoogleGenAI, GenerateContentResponse, Type } from "@google/genai";
 import { GoogleGenAI, Chat } from '@google/genai';
 import { marked } from 'marked';
 import hljs from 'highlight.js';
->>>>>>> a82d405ed7b34abd96f3ee904fd03991111ba12e
 
 // FIX: Declare types for external libraries loaded via script tags
 declare var Chart: any;
@@ -72,8 +69,6 @@ interface ChartDataPoint {
 
 // --- MOCK DATA & CONFIG ---
 const API_KEY = process.env.API_KEY;
-<<<<<<< HEAD
-=======
 
 // DOM Elements
 const output = document.getElementById('output') as HTMLDivElement;
@@ -124,13 +119,11 @@ const SVG_ICON_DOCS = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 2
 const SVG_ICON_REFACTOR = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor"><path d="M12.94 4.94c-.38-.38-1-.38-1.38 0L3.69 12.81c-.38.38-.56.88-.56 1.38V18h3.81c.5 0 1-.18 1.38-.56L16.19 9.56c.38-.38.38-1 0-1.38L12.94 4.94zM7.5 16c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5S8.33 16 7.5 16zm12.5-5.5c0-.83-.67-1.5-1.5-1.5s-1.5.67-1.5 1.5.67 1.5 1.5 1.5 1.5-.67 1.5-1.5zM19 16.5c-.83 0-1.5-.67-1.5-1.5s.67-1.5 1.5-1.5 1.5.67 1.5 1.5-.67 1.5-1.5 1.5zM20.71 7.29l-3.42-3.42c-.2-.2-.45-.29-.71-.29s-.51.1-.71.29l-1.53 1.53c-.38.38-.38 1 0 1.38l3.42 3.42c.38.38 1 .38 1.38 0l1.53-1.53c.38-.38.38-1 0-1.38z"/></svg>`;
 
 
->>>>>>> a82d405ed7b34abd96f3ee904fd03991111ba12e
 if (!API_KEY) {
   console.warn("API_KEY environment variable not set. Gemini provider will not work.");
 }
 const ai = new GoogleGenAI({ apiKey: API_KEY! });
 
-<<<<<<< HEAD
 const JSON_SCHEMA = {
     type: Type.OBJECT,
     properties: {
@@ -214,7 +207,7 @@ const MOCK_NEWS = [
     "Whale activity spotted moving large amounts of ETH to cold storage.",
     "Geopolitical tensions in Eastern Europe cause market uncertainty."
 ];
-=======
+
 const ai = new GoogleGenAI({ apiKey: API_KEY });
 
 // --- History & Settings Management ---
