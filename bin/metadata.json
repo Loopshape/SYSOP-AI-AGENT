@@ -1,0 +1,5 @@
+{
+  "name": "AI DevOps Agent",
+  "description": "An AI-powered multicore to help with your development and operations tasks.",
+  "requestFramePermissions": []
+}

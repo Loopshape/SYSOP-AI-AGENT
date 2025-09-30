@@ -747,7 +747,6 @@ form.addEventListener('submit', async (e) => {
   }
   const prompt = input.value.trim();
   if (!prompt) return;
->>>>>>> a82d405ed7b34abd96f3ee904fd03991111ba12e
 
 const MOCK_ORDER_BOOK = {
     bids: [
@@ -766,11 +765,8 @@ const MOCK_ORDER_BOOK = {
     ],
 };
 
-<<<<<<< HEAD
-=======
   await appendMessage('user', prompt);
   let loadingIndicator = await showLoadingIndicator();
->>>>>>> a82d405ed7b34abd96f3ee904fd03991111ba12e
 
 // --- STATE MANAGEMENT ---
 let selectedPersonaId: string = PERSONAS[0].id;
@@ -799,7 +795,6 @@ let walletAddress: string | null = null;
 // --- PERSISTENCE ---
 const saveState = () => {
   try {
-<<<<<<< HEAD
     const stateToSave = {
       selectedPersonaId,
       selectedProviderId,
@@ -815,7 +810,6 @@ const saveState = () => {
     localStorage.setItem('aiBitboyState', JSON.stringify(stateToSave));
   } catch (error) {
     console.error("Failed to save state to localStorage:", error);
-=======
     const result = await chat.sendMessageStream({ message: prompt });
     let fullResponse = '';
     let aiMessageContent: HTMLDivElement | null = null;
@@ -859,11 +853,9 @@ const saveState = () => {
     await appendErrorMessage(
       'An error occurred while processing your request. Please check the console for details and try again.'
     );
->>>>>>> a82d405ed7b34abd96f3ee904fd03991111ba12e
   }
 };
 
-<<<<<<< HEAD
 const loadState = (): boolean => {
   const savedStateJSON = localStorage.getItem('aiBitboyState');
   if (savedStateJSON) {
@@ -1870,7 +1862,6 @@ const initializeApp = async () => {
 
 
 document.addEventListener('DOMContentLoaded', initializeApp);
-=======
 // Auto-resize textarea
 input.addEventListener('input', () => {
   input.style.height = 'auto';
@@ -2184,4 +2175,3 @@ window.addEventListener('load', () => {
     const webSearchEnabled = getWebSearchSetting();
     initializeChat(currentInstruction, webSearchEnabled);
 });
->>>>>>> a82d405ed7b34abd96f3ee904fd03991111ba12e

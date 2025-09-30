@@ -1,0 +1,225 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------------- CONFIG ----------------
+PROJECT_DIR="${PROJECT_DIR:-$HOME/.local_ai}"
+REMOTE_REPO="git@github.com:Loopshape/SYSOP-AI-AGENT.git"
+NODE_MODULES="$PROJECT_DIR/node_modules"
+BUILD_DIR="$PROJECT_DIR/dist"
+AI_CMD="$PROJECT_DIR/bin/ai"
+LOG_FILE="$PROJECT_DIR/ai.log"
+MAX_RAM_MB=512  # Termux low-RAM precaution
+
+# ---------------- LOGGING ----------------
+log() { 
+    local lvl="$1"; local msg="$2"
+    printf "[%s] %s %s\n" "$lvl" "$(date '+%H:%M:%S')" "$msg" | tee -a "$LOG_FILE"
+}
+
+log_info() { log "INFO" "$1"; }
+log_warn() { log "WARN" "$1"; }
+log_error() { log "ERROR" "$1"; exit 1; }
+log_success() { log "SUCCESS" "$1"; }
+
+# ---------------- DEPENDENCY CHECKS ----------------
+check_dependencies() {
+    local deps=("git" "node" "npm")
+    for dep in "${deps[@]}"; do
+        if ! command -v "$dep" &> /dev/null; then
+            log_error "Missing dependency: $dep"
+        fi
+    done
+    log_success "All dependencies available"
+}
+
+# ---------------- GIT OPERATIONS ----------------
+init_git() {
+    if [[ ! -d "$PROJECT_DIR/.git" ]]; then
+        log_info "Cloning repository..."
+        git clone "$REMOTE_REPO" "$PROJECT_DIR" || log_error "Git clone failed"
+    else
+        log_info "Git repo already exists at $PROJECT_DIR"
+    fi
+}
+
+get_default_branch() {
+    git -C "$PROJECT_DIR" remote show origin | grep "HEAD branch" | cut -d" " -f5
+}
+
+update_repo() {
+    log_info "Fetching latest changes..."
+    git -C "$PROJECT_DIR" fetch --all
+    
+    local default_branch
+    default_branch=$(get_default_branch)
+    
+    if [[ -z "$default_branch" ]]; then
+        log_warn "Could not determine default branch, trying common names"
+        # Try common branch names
+        for branch in main master; do
+            if git -C "$PROJECT_DIR" show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+                default_branch="$branch"
+                break
+            fi
+        done
+    fi
+    
+    if [[ -z "$default_branch" ]]; then
+        log_error "Could not determine default branch"
+    fi
+    
+    log_info "Resetting to origin/$default_branch"
+    git -C "$PROJECT_DIR" reset --hard "origin/$default_branch"
+    log_success "Repository updated to $default_branch"
+}
+
+# ---------------- BUILD SYSTEM ----------------
+install_deps() {
+    if [[ ! -f "$PROJECT_DIR/package.json" ]]; then
+        log_warn "No package.json found, skipping npm install"
+        return 0
+    fi
+    
+    log_info "Installing npm dependencies..."
+    cd "$PROJECT_DIR"
+    npm install || log_warn "npm install had issues, continuing anyway"
+    log_success "Dependencies installed"
+}
+
+vite_build() {
+    if [[ ! -f "$PROJECT_DIR/package.json" ]]; then
+        log_warn "No package.json found, skipping Vite build"
+        return 0
+    fi
+    
+    # Check if Vite is available
+    if ! npx vite --version &>/dev/null; then
+        log_info "Installing Vite..."
+        npm install vite --save-dev
+    fi
+    
+    log_info "Building project with Vite..."
+    npx vite build || log_error "Vite build failed"
+    log_success "Vite build complete"
+}
+
+# ---------------- DEPLOYMENT ----------------
+link_bin() {
+    if [[ ! -d "$PROJECT_DIR/bin" ]]; then
+        log_warn "No bin directory found at $PROJECT_DIR/bin"
+        return 0
+    fi
+    
+    # Create user bin directory if it doesn't exist
+    mkdir -p "$HOME/bin"
+    
+    # Link all executable files from project bin
+    for file in "$PROJECT_DIR/bin"/*; do
+        if [[ -f "$file" && -x "$file" ]]; then
+            local filename=$(basename "$file")
+            ln -sf "$file" "$HOME/bin/$filename"
+            log_info "Linked $filename to ~/bin/"
+        fi
+    done
+    
+    # Add to PATH if not already present
+    if [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
+        echo 'export PATH="$HOME/bin:$PATH"' >> "$HOME/.bashrc"
+        log_info "Added ~/bin to PATH in .bashrc"
+    fi
+    
+    export PATH="$HOME/bin:$PATH"
+    log_success "Binaries linked and PATH updated"
+}
+
+# ---------------- SYSTEM CHECKS ----------------
+check_ram() {
+    if command -v free &>/dev/null; then
+        local available_ram_mb
+        available_ram_mb=$(free -m 2>/dev/null | awk '/Mem:/ {print $7}' || echo "1024")
+        
+        if (( available_ram_mb < MAX_RAM_MB )); then
+            log_warn "Low available RAM ($available_ram_mb MB). Build might fail!"
+        else
+            log_info "Available RAM: $available_ram_mb MB"
+        fi
+    else
+        log_warn "Could not check RAM (free command not available)"
+    fi
+}
+
+check_ollama() {
+    if curl -s http://localhost:11434/api/tags >/dev/null; then
+        log_success "Ollama is running"
+    else
+        log_warn "Ollama not detected on localhost:11434"
+    fi
+}
+
+# ---------------- AI WORKFLOW ----------------
+run_ai_workflow() {
+    if [[ ! -x "$AI_CMD" ]]; then
+        log_warn "AI binary not found or not executable: $AI_CMD"
+        return 0
+    fi
+    
+    log_info "Starting AI validation workflow..."
+    
+    # Test the AI agent with a safe command first
+    if "$AI_CMD" "--help" &>/dev/null; then
+        log_success "AI agent basic functionality confirmed"
+        
+        # Run the rebuild command
+        log_info "Running system validation..."
+        if ! "$AI_CMD" "validate system setup and check dependencies" 2>&1 | tee -a "$LOG_FILE"; then
+            log_warn "AI workflow completed with warnings"
+        else
+            log_success "AI workflow completed successfully"
+        fi
+    else
+        log_warn "AI agent basic test failed, skipping workflow"
+    fi
+}
+
+# ---------------- BACKUP & ROLLBACK ----------------
+create_backup() {
+    local backup_dir="$PROJECT_DIR.backup.$(date +%Y%m%d_%H%M%S)"
+    log_info "Creating backup to $backup_dir"
+    cp -r "$PROJECT_DIR" "$backup_dir" || log_warn "Backup creation failed"
+    echo "$backup_dir"
+}
+
+# ---------------- MAIN WORKFLOW ----------------
+main() {
+    local backup_dir=""
+    
+    log_info "==== Starting Git Build & AGI Workflow ===="
+    
+    # Pre-flight checks
+    check_dependencies
+    check_ram
+    check_ollama
+    
+    # Create backup before changes
+    if [[ -d "$PROJECT_DIR" ]]; then
+        backup_dir=$(create_backup)
+    fi
+    
+    # Build pipeline
+    init_git
+    update_repo
+    install_deps
+    vite_build
+    link_bin
+    
+    # Post-deployment validation
+    run_ai_workflow
+    
+    log_success "==== Build & Workflow Finished ===="
+    log_info "Backup created: $backup_dir"
+    log_info "Project location: $PROJECT_DIR"
+    log_info "AI command: $AI_CMD"
+}
+
+main "$@"

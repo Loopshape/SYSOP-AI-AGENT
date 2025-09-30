@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+PROJECT_DIR="${PROJECT_DIR:-$HOME/.local_ai}"
+HASH_INDEX_DIR="${HASH_INDEX_DIR:-$PROJECT_DIR/.hash_index}"
+SERVE_HOST="127.0.0.1"
+SERVE_PORT="8888"
+
+log() { local lvl="$1"; local msg="$2"; printf "[%s] %s %s\n" "$lvl" "$(date '+%H:%M:%S')" "$msg"; }
+log_info() { log "INFO" "$1"; }
+log_warn() { log "WARN" "$1"; }
+log_success() { log "SUCCESS" "$1"; }
+
+# ---------------- 1️⃣ Check merge conflicts ----------------
+log_info "Checking for leftover merge conflict markers..."
+if grep -r '<<<<<<<\|=======\|>>>>>>>' "$PROJECT_DIR"; then
+    log_warn "Some merge conflict markers remain!"
+else
+    log_success "No merge conflict markers found."
+fi
+
+# ---------------- 2️⃣ Check npm dependencies ----------------
+log_info "Verifying npm dependencies..."
+cd "$PROJECT_DIR"
+if npm install &>/dev/null; then
+    log_success "Dependencies installed successfully."
+else
+    log_warn "npm install encountered issues."
+fi
+
+# ---------------- 3️⃣ Verify Vite build ----------------
+log_info "Verifying Vite build..."
+if vite build &>/dev/null; then
+    log_success "Vite build completed successfully."
+else
+    log_warn "Vite build failed. Check output above."
+fi
+
+# ---------------- 4️⃣ Test server ----------------
+log_info "Testing server availability..."
+./ai.sh serve --daemon &>/dev/null &
+sleep 3
+HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://${SERVE_HOST}:${SERVE_PORT}/index.html")
+if [[ "$HTTP_STATUS" == "200" ]]; then
+    log_success "Server reachable (HTTP 200 OK)"
+else
+    log_warn "Server not reachable (HTTP $HTTP_STATUS)"
+fi
+
+# ---------------- 5️⃣ Test hash system ----------------
+log_info "Testing hash system..."
+TEST_HASH=$(./ai.sh --hash "Self-check content")
+if [[ -n "$TEST_HASH" ]]; then
+    log_success "Hash system functional. Test hash: $TEST_HASH"
+    ./ai.sh --hashed "$TEST_HASH" &>/dev/null && log_success "Content retrieval OK"
+else
+    log_warn "Hash system failed to generate hash."
+fi
+
+# ---------------- 6️⃣ Check watchdog log ----------------
+WATCHDOG_LOG="$PROJECT_DIR/watchdog.log"
+log_info "Checking watchdog log..."
+if [[ -f "$WATCHDOG_LOG" ]]; then
+    tail -n 5 "$WATCHDOG_LOG"
+else
+    log_warn "Watchdog log not found. Start daemon to enable self-healing."
+fi
+
+log_success "Self-check complete."
