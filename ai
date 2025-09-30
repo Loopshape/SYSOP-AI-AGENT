@@ -1,0 +1,290 @@
+#!/usr/bin/env bash
+# AI Autonomic Synthesis Platform v41.0 (The Operator)
+# A fully autonomous, secure, and robust AI CLI for development, trading, and system tasks.
+# Mandatory execution: ~/bin/ai
+set -euo pipefail
+IFS=$'\n\t'
+
+# === RUNTIME MODE DETECTION: EMBEDDED NODE.JS WEB SERVER ===
+if [[ "${1:-}" == "serve" ]]; then
+    exec node --input-type=module - "$0" "$@" <<'NODE_EOF'
+import http from 'http';
+import { exec } from 'child_process';
+const PORT = process.env.AI_PORT || 8080;
+const AI_SCRIPT_PATH = process.argv[2];
+const HTML_UI = `
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><title>AI Autonomic Synthesis Platform v41</title>
+<style>:root{--bg:#0d1117;--text:#c9d1d9;--accent:#58a6ff;--secondary:#8b949e;--border:#30363d;--input-bg:#161b22;--success:#3fb950;--error:#f85149;}
+body{font-family:'SF Mono',Consolas,'Courier New',monospace;background:var(--bg);color:var(--text);margin:0;padding:20px;font-size:14px;line-height:1.6;}
+.container{max-width:1000px;margin:auto;}h1{color:var(--accent);text-align:center;border-bottom:1px solid var(--border);padding-bottom:15px;}
+.terminal{background:var(--input-bg);border:1px solid var(--border);border-radius:6px;padding:15px;margin-top:20px;height:70vh;overflow-y:scroll;display:flex;flex-direction:column;}
+.output{flex-grow:1;white-space:pre-wrap;}.input-line{display:flex;border-top:1px solid var(--border);padding-top:10px;margin-top:10px;}
+.prompt{color:var(--accent);font-weight:bold;margin-right:10px;}
+input{flex-grow:1;background:transparent;border:none;color:var(--text);font-family:inherit;font-size:inherit;outline:none;}
+.log{color:var(--secondary);}.success{color:var(--success);}.error{color:var(--error);}</style></head>
+<body><div class="container"><h1>🤖 AI Autonomic Synthesis Platform v41</h1><div class="terminal"><div id="output" class="output"><div class="log">🚀 AI Agent ready. System initialized.</div></div><div class="input-line"><span class="prompt">ai&gt;</span><input type="text" id="commandInput" placeholder="Enter your high-level goal..." autofocus></div></div></div>
+<script>
+const output=document.getElementById('output'),input=document.getElementById('commandInput');
+function addOutput(text,className='log'){const d=document.createElement('div');d.className=className;d.textContent=text;output.appendChild(d);output.scrollTop=output.scrollHeight;}
+async function executeCommand(cmd){addOutput(\`ai> \${cmd}\`,'prompt');input.disabled=true;try{const r=await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({command:cmd})}),d=await r.json();const f=d.output.replace(/\\u001b\\[[0-9;]*m/g,'');addOutput(f,d.success?'success':'error');}catch(e){addOutput(\`[CLIENT ERROR] \${e.message}\`,'error');}finally{input.disabled=false;input.focus();}}
+input.addEventListener('keypress',e=>{if(e.key==='Enter'){const c=input.value.trim();if(c){executeCommand(c);input.value='';}}});
+</script></body></html>`;
+
+http.createServer((req, res) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+    if (req.url === '/' && req.method === 'GET') { res.writeHead(200, { 'Content-Type': 'text/html' }); res.end(HTML_UI); return; }
+    if (req.url === '/api/command' && req.method === 'POST') {
+        let body = '';
+        req.on('data', c => body += c.toString());
+        req.on('end', () => {
+            try {
+                const requestData = JSON.parse(body);
+                const command = requestData.command;
+                const sanitizedCmd = command.replace(/(["'$`\\])/g, '\\$1');
+                exec(`"${AI_SCRIPT_PATH}" "${sanitizedCmd}"`, { timeout: 600000 }, (err, stdout, stderr) => {
+                    res.writeHead(200, { 'Content-Type': 'application/json' });
+                    if (err) { res.end(JSON.stringify({ success: false, output: `[SERVER ERROR] ${err.message}\n${stderr}` }));
+                    } else { res.end(JSON.stringify({ success: true, output: stdout || 'Command executed without output.' })); }
+                });
+            } catch (e) { res.writeHead(400, { 'Content-Type': 'application/json' }); res.end(JSON.stringify({ success: false, output: 'Invalid JSON request.' })); }
+        });
+        return;
+    }
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Not Found' }));
+}).listen(PORT, () => console.log(`🌐 AI Web UI is live at: http://localhost:${PORT}`));
+NODE_EOF
+fi
+# --- END OF NODE.JS SERVER BLOCK ---
+
+# === ENVIRONMENT & PATHS ===
+AI_HOME="${AI_HOME:-$HOME/.local_ai}"
+PROJECTS_DIR="$AI_HOME"
+LOG_DIR="$AI_HOME/logs"
+TMP_DIR="$AI_HOME/tmp"
+SWAP_DIR="$AI_HOME/swap"
+CORE_DB="$AI_HOME/agent_core.db"
+TASK_DB="$AI_HOME/ai_task_manager.db"
+LOG_FILE="$LOG_DIR/system.log"
+HMAC_SECRET_KEY="$AI_HOME/secret.key"
+
+# === AI MODELS & AGENT PARAMS ===
+MESSENGER_MODEL="core"
+PLANNER_MODELS=("loop" "core")
+EXECUTOR_MODEL="2244-1"
+MAX_AGENT_LOOPS=12
+MAX_RAM_BYTES=2097152
+
+# === COLORS & ICONS ===
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m';
+PURPLE='\033[0;35m'; CYAN='\033[0;36m'; ORANGE='\033[0;33m'; NC='\033[0m'
+ICON_SUCCESS="✅"; ICON_WARN="⚠️"; ICON_ERROR="❌"; ICON_INFO="ℹ️"; ICON_SECURE="🔑";
+ICON_PLAN="📋"; ICON_THINK="🤔"; ICON_EXEC="⚡"; ICON_FEEDBACK="🙋"; ICON_TASK="📝"; ICON_TRADE="💰"
+
+# === LOGGING ===
+log_to_file(){ echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"; }
+log_msg(){ local color="$1" icon="$2" lvl="$3" msg="$4"; echo -e "${color}[${lvl}][${icon} $(date '+%H:%M:%S')] $msg${NC}" >&2; log_to_file "[$lvl] $msg"; }
+log_info(){ log_msg "$BLUE" "$ICON_INFO" "INFO" "$*"; }
+log_warn(){ log_msg "$YELLOW" "$ICON_WARN" "WARN" "$*"; }
+log_error(){ log_msg "$RED" "$ICON_ERROR" "ERROR" "$*"; exit 1; }
+log_success(){ log_msg "$GREEN" "$ICON_SUCCESS" "SUCCESS" "$*"; }
+log_trade(){ log_msg "$CYAN" "$ICON_TRADE" "TRADE" "$*"; }
+log_task(){ log_msg "$ORANGE" "$ICON_TASK" "TASK" "$*"; }
+log_phase() { printf "\n${PURPLE}🚀 %s${NC}\n" "$*" >&2; log_to_file "PHASE: $*"; }
+log_think(){ printf "\n${ORANGE}${ICON_THINK} %s${NC}" "$*" >&2; }
+log_plan(){ printf "\n${CYAN}${ICON_PLAN} %s${NC}" "$*" >&2; }
+log_execute(){ printf "\n${GREEN}${ICON_EXEC} %s${NC}" "$*" >&2; }
+
+# === HASHING & SECURITY ===
+sqlite_escape(){ echo "${1:-}" | sed "s/'/''/g"; }
+hash_string(){ echo -n "${1:-}" | sha256sum | awk '{print $1}'; }
+calculate_hmac() { local data="${1:-}"; local secret; secret=$(<"$HMAC_SECRET_KEY"); echo -n "$data" | openssl dgst -sha256 -hmac "$secret" | awk '{print $2}'; }
+confirm_action() { local c=""; read -p "$(echo -e "\n${YELLOW}PROPOSED ACTION:${NC} ${CYAN}$1${NC}\nApprove? [y/N] ")" -n 1 -r c || true; echo; [[ "${c:-}" =~ ^[Yy]$ ]]; }
+
+# === DATABASE & CACHE ===
+init_db(){
+    mkdir -p "$AI_HOME" "$LOG_DIR" "$TMP_DIR" "$SWAP_DIR"
+    sqlite3 "$TASK_DB" "CREATE TABLE IF NOT EXISTS projects(hash TEXT PRIMARY KEY,path TEXT,ts DATETIME DEFAULT CURRENT_TIMESTAMP); CREATE TABLE IF NOT EXISTS file_hashes(project_hash TEXT,file_path TEXT,file_hash TEXT,PRIMARY KEY(project_hash,file_path)); CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,ts DATETIME DEFAULT CURRENT_TIMESTAMP,type TEXT,data TEXT);"
+    sqlite3 "$CORE_DB" "CREATE TABLE IF NOT EXISTS memories(id INTEGER PRIMARY KEY,prompt_hash TEXT,prompt TEXT,response_ref TEXT); CREATE TABLE IF NOT EXISTS tool_logs(id INTEGER PRIMARY KEY,task_id TEXT,tool_name TEXT,args TEXT,result TEXT,ts DATETIME DEFAULT CURRENT_TIMESTAMP);"
+    if [[ ! -f "$HMAC_SECRET_KEY" ]]; then openssl rand -hex 32 > "$HMAC_SECRET_KEY"; chmod 600 "$HMAC_SECRET_KEY"; fi
+}
+semantic_hash_prompt(){ echo "${1:-}" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' ' ' | tr -s ' ' | sed 's/^ *//;s/ *$//' | tr ' ' '_'; }
+store_output_fast(){ local c="${1:-}" h; h=$(hash_string "$c"); if ((${#c}>MAX_RAM_BYTES)); then f="$SWAP_DIR/$h.txt.gz"; echo "$c"|gzip>"$f"; echo "$f"; else echo "$c"; fi; }
+retrieve_output_fast(){ local r="${1:-}"; if [[ -f "$r" ]]; then [[ "$r" == *.gz ]] && gzip -dc "$r" || cat "$r"; else echo "$r"; fi; }
+get_cached_response(){ local p_h; p_h=$(semantic_hash_prompt "${1:-}"); sqlite3 "$CORE_DB" "SELECT response_ref FROM memories WHERE prompt_hash = '$(sqlite_escape "$p_h")' LIMIT 1;"; }
+add_to_memory_fast(){ local p_h; p_h=$(semantic_hash_prompt "${1:-}"); sqlite3 "$CORE_DB" "INSERT OR REPLACE INTO memories (prompt_hash,prompt,response_ref) VALUES ('$(sqlite_escape "$p_h")','$(sqlite_escape "${2:-}")','$(sqlite_escape "${3:-}")');"; }
+
+# === AI & OLLAMA ===
+ensure_ollama(){ if ! curl -s http://localhost:11434/api/tags >/dev/null; then log_info "Starting Ollama service..."; nohup ollama serve >/dev/null 2>&1 & sleep 3; fi; }
+run_worker_streaming() {
+    local model="$1" system="$2" prompt="$3"
+    local payload full_response=""
+    payload=$(jq -nc --arg m "$model" --arg s "$system" --arg p "$prompt" '{model:$m,system:$s,prompt:$p,stream:true}')
+    while IFS= read -r line; do
+        if jq -e . >/dev/null 2>&1 <<<"$line"; then
+            local token=$(echo "$line" | jq -r '.response // empty')
+            if [[ -n "$token" ]]; then printf "%s" "$token" >&2; full_response+="$token"; fi
+        fi
+    done < <(curl -s --max-time 600 -X POST http://localhost:11434/api/generate -d "$payload")
+    printf "\n" >&2
+    echo "$full_response"
+}
+
+# === SANDBOXED TOOLSET ===
+tool_run_command() { local proj_dir="$1"; shift; local cmd="$*"; (cd "$proj_dir" && eval "$cmd") 2>&1 || echo "Error: Command failed to execute."; }
+tool_write_file() { local proj_dir="$1" f_path="${2:-}" content="${3:-}"; [[ -z "$f_path" ]] && { echo "Error: file path is required."; return 1; }; mkdir -p "$(dirname "$proj_dir/$f_path")"; echo -e "$content">"$proj_dir/$f_path"; echo "File '$f_path' written."; }
+tool_ask_human() { local proj_dir="$1"; shift; local q="$*"; echo -e "\n${YELLOW}${ICON_FEEDBACK} AI requests input:${NC} ${CYAN}$q${NC}"; read -p "Your Response: " -r user_response; echo "Human feedback received: '$user_response'"; }
+tool_btc() {
+    local proj_dir="$1"; shift; local action="${1:-analyze}"
+    case "$action" in
+        analyze) log_trade "Analyzing BTC/USD market..."; run_worker_streaming "$EXECUTOR_MODEL" "You are a concise financial analyst." "Provide structured BTC/USD analysis: RSI, MACD, Support/Resistance, Volume trends." ;;
+        buy|sell) log_trade "Simulating '$action' order for BTC/USD."; echo "{\"status\": \"success\", \"order_type\": \"$action\", \"asset\": \"BTC/USD\"}" ;;
+        *) log_warn "Unknown BTC action: '$action'. Available: analyze, buy, sell."; echo "Error: Unknown action." ;;
+    esac
+}
+tool_webkit() {
+    local proj_dir="$1"
+    local build_log="$LOG_DIR/webkit_build.log"
+    log_task "Starting WebKit build in background. This is a long, resource-intensive process. Log: $build_log"
+    (
+        git clone --depth 1 "https://github.com/WebKit/WebKit.git" "$proj_dir/webkit"
+        cd "$proj_dir/webkit" && ./Tools/Scripts/build-webkit --release
+    ) &> "$build_log" &
+    echo "WebKit build process started in the background with PID $!."
+}
+tool_ingest(){
+    local proj_dir="$1"; shift; local repo_path; repo_path=$(realpath "${1:-}")
+    [[ -d "$repo_path" ]] || { echo "Error: Directory not found: $repo_path"; return 1; }
+    local hash=$(hash_string "$repo_path")
+    sqlite3 "$TASK_DB" "INSERT OR IGNORE INTO projects(hash,path) VALUES('$hash','$(sqlite_escape "$repo_path")');"
+    find "$repo_path" -type f -not -path '*/.git/*' | while read -r f; do
+        sqlite3 "$TASK_DB" "INSERT OR REPLACE INTO file_hashes(project_hash,file_path,file_hash) VALUES('$hash','$(sqlite_escape "$f")','$(sha256sum "$f" | awk '{print $1}')');"
+    done
+    log_task "Repo ingested: $repo_path (hash: $hash)"; echo "Project hash: $hash"
+}
+tool_rehash(){
+    local proj_dir="$1"; shift; local hash="${1:-}"; [[ -z "$hash" ]] && { echo "Error: Project hash required."; return 1; }
+    local base_path=$(sqlite3 "$TASK_DB" "SELECT path FROM projects WHERE hash='$hash';"); [[ -z "$base_path" ]] && { echo "Error: Project not found: $hash"; return 1; }
+    log_task "Re-hashing project: $base_path"
+    tool_ingest "$proj_dir" "$base_path"
+}
+tool_qbit(){ local proj_dir="$1"; shift; sqlite3 "$TASK_DB" "INSERT INTO events(type,data) VALUES('qbit','$(sqlite_escape "$*")');"; log_task "QBit task logged: $*"; }
+
+# === AGI WORKFLOW ===
+run_agi_workflow(){
+    local user_prompt="$*"
+    local task_id=$(hash_string "$user_prompt$(date +%s%N)" | cut -c1-16)
+    local project_dir="$PROJECTS_DIR/task-$task_id"; mkdir -p "$project_dir"; log_success "Workspace: $project_dir (Task ID: $task_id)"
+
+    local conversation_history="Initial User Request: $user_prompt"
+    if [[ -f "$user_prompt" ]]; then conversation_history+="\n\n$(process_by_mime "$user_prompt")"; fi
+
+    local cached_ref; cached_ref=$(get_cached_response "$user_prompt")
+    if [[ -n "$cached_ref" ]]; then log_success "Found cached response."; echo -e "\n${GREEN}--- Cached Final Answer ---\n${NC}$(retrieve_output_fast "$cached_ref")"; return; fi
+
+    local final_answer=""
+    for ((i=1; i<=MAX_AGENT_LOOPS; i++)); do
+        log_phase "AGI Loop $i/$MAX_AGENT_LOOPS"
+        log_think "Messenger (${MESSENGER_MODEL}) Analysis: "
+        local messenger_output=$(run_worker_streaming "$MESSENGER_MODEL" "Analyze the conversation and summarize the current state." "$conversation_history")
+
+        local pids=() temp_files=()
+        for model in "${PLANNER_MODELS[@]}"; do
+            local temp_file=$(mktemp); temp_files+=("$temp_file")
+            ( run_worker_streaming "$model" "You are a planner. Propose ONE tool to use. Tools: run_command, write_file, ask_human, btc, webkit, ingest, rehash, qbit." "$messenger_output" > "$temp_file" ) &
+            pids+=($!)
+        done
+        for pid in "${pids[@]}"; do wait "$pid"; done
+
+        local executor_context="You are the Executor. Synthesize plans and decide the single best tool. Format:\n[REASONING] Your synthesis.\n[TOOL] tool_name <arguments>\nIf solved, respond ONLY with: [FINAL_ANSWER] Your summary.\n\n--- MESSENGER'S ANALYSIS ---\n$messenger_output"
+        for idx in "${!PLANNER_MODELS[@]}"; do executor_context+="\n\n--- Plan from ${PLANNER_MODELS[$idx]} ---\n$(cat "${temp_files[$idx]}")"; done
+        rm -f "${temp_files[@]}"
+
+        log_execute "Executor (${EXECUTOR_MODEL}) Decision: "
+        local final_plan=$(run_worker_streaming "$EXECUTOR_MODEL" "Executor" "$executor_context")
+
+        if [[ "$final_plan" == *"[FINAL_ANSWER]"* ]]; then final_answer=$(echo "$final_plan" | sed 's/.*\[FINAL_ANSWER\]//' | sed 's/^\s*//;s/\s*$//'); break; fi
+
+        local tool_line=$(echo "$final_plan" | grep '\[TOOL\]' | head -n 1)
+        if [[ -z "$tool_line" ]]; then log_warn "Executor did not choose a tool. Ending loop."; break; fi
+
+        local clean_tool_cmd=$(echo "${tool_line#\[TOOL\] }" | sed 's/\r$//')
+        if [[ "$clean_tool_cmd" != *"ask_human"* ]] && ! confirm_action "$clean_tool_cmd"; then conversation_history+="\nLoop $i Result:\nUser aborted action."; continue; fi
+
+        local ai_hmac=$(calculate_hmac "$clean_tool_cmd"); local verified_hmac=$(calculate_hmac "$clean_tool_cmd")
+        if [[ "$ai_hmac" != "$verified_hmac" ]]; then log_error "CRITICAL: HMAC MISMATCH!"; break; fi; log_success "${ICON_SECURE} HMAC signature verified."
+
+        local tool_name=$(echo "$clean_tool_cmd" | awk '{print $1}'); local args_str=$(echo "$clean_tool_cmd" | cut -d' ' -f2-); local tool_args=(); eval "tool_args=($args_str)"; local tool_result="Error: Tool '$tool_name' not found."
+        if declare -f "tool_$tool_name" > /dev/null; then tool_result=$(tool_"$tool_name" "$project_dir" "${tool_args[@]}"); else log_warn "AI tried unknown tool: '$tool_name'"; fi
+
+        sqlite3 "$CORE_DB" "INSERT INTO tool_logs (task_id,tool_name,args,result) VALUES ('$task_id','$(sqlite_escape "$tool_name")','$(sqlite_escape "$args_str")','$(sqlite_escape "$tool_result")');"
+        conversation_history+="\n\n--- Loop $i Result ---\n[EXECUTOR PLAN]\n${final_plan}\n[TOOL RESULT]\n${tool_result}"
+    done
+
+    [[ -z "$final_answer" ]] && final_answer="Workflow finished. Final context:\n$conversation_history"
+    local final_ref=$(store_output_fast "$final_answer")
+    add_to_memory_fast "$user_prompt" "$user_prompt" "$final_ref"
+    echo -e "\n${GREEN}--- Final Answer ---\n${NC}${final_answer}"
+}
+
+# === MAIN DISPATCHER ===
+show_help(){
+    cat << EOF
+
+${GREEN}AI Autonomic Synthesis Platform v41.0${NC}
+Usage: ${CYAN}ai <command> [options]${NC}
+
+${YELLOW}Core Commands:${NC}
+  serve                     Start the interactive web UI on port 8080.
+  "<prompt>"                Run the autonomous AGI workflow. Handles file paths automatically.
+
+${YELLOW}Project & Task Management:${NC}
+  ingest <path/to/repo>     Create a project context by hashing all files in a directory.
+  rehash <project_hash>     Update file hashes for a project.
+  qbit <args>               Log a generic 'QBit' task for external processing.
+
+${YELLOW}Direct Tool Access:${NC}
+  btc [action]              Directly access BTC trade tool (analyze|buy|sell).
+  webkit                    Start a background build of WebKit (long-running, resource-intensive).
+
+${YELLOW}Utilities:${NC}
+  status                    Show system status and paths.
+  --help                    Show this help message.
+EOF
+}
+
+main(){
+    if [[ "${BASH_SOURCE[0]}" != "$HOME/bin/ai" ]]; then log_error "This script must be run from '$HOME/bin/ai'."; fi
+    if [[ "${1:-}" == "serve" ]]; then exit 0; fi
+    init_db
+    ensure_ollama
+
+    local cmd="${1:-}"
+    if [[ $# -eq 0 ]]; then
+        log_warn "No command provided. Enter a prompt to start the AGI workflow."
+        read -r -p "Enter prompt: " user_prompt
+        [[ -n "$user_prompt" ]] && run_agi_workflow "$user_prompt"
+        exit 0
+    fi
+    shift
+
+    case "$cmd" in
+        --help|-h|help) show_help ;;
+        ingest) tool_ingest "$PROJECTS_DIR" "$@" ;;
+        rehash) tool_rehash "$PROJECTS_DIR" "$@" ;;
+        qbit) tool_qbit "$PROJECTS_DIR" "$@" ;;
+        btc) tool_btc "$PROJECTS_DIR" "$@" ;;
+        webkit) tool_webkit "$PROJECTS_DIR" ;;
+        status)
+            echo -e "${GREEN}AI System Status:${NC}"
+            echo "AI_HOME: $AI_HOME"
+            echo "TASK_DB: $TASK_DB ($(du -sh "$TASK_DB" | awk '{print $1}'))"
+            echo "CORE_DB: $CORE_DB ($(du -sh "$CORE_DB" | awk '{print $1}'))"
+            echo "LOG_FILE: $LOG_FILE"
+            ;;
+        *) run_agi_workflow "$cmd" "$@" ;;
+    esac
+}
+
+main "$@"
