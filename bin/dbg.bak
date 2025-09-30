@@ -1,0 +1,184 @@
+#!/bin/bash
+# debug_tokens.sh - Enhanced token exchange analyzer
+# Shows AI thinking process in human-readable format with detailed categorization
+
+SCRIPT_TO_DEBUG="${1:-ai_studio_code_21.sh}"
+shift || true
+
+# Color removal function (more robust)
+remove_colors() {
+    echo "$1" | sed -E 's/\x1B\[[0-9;]*[mGK]//g'
+}
+
+# Timestamp function
+timestamp() {
+    echo "[$(date '+%H:%M:%S')]"
+}
+
+# Enhanced line analyzer with pattern matching
+analyze_line() {
+    local clean_line="$1"
+    
+    # Ollama internal thinking patterns
+    if [[ "$clean_line" =~ ^\>\>\>.* ]]; then
+        echo "🤔 OLLAMA INTERNAL: ${clean_line:4}"
+    
+    # AI reasoning and cognitive processes
+    elif [[ "$clean_line" =~ [Tt]hink|[Cc]onsider|[Aa]nalyze|[Pp]lan ]]; then
+        echo "🧠 COGNITIVE PROCESS: $clean_line"
+    
+    # Model loading and initialization
+    elif [[ "$clean_line" =~ [Mm]odel|[Ll]oading|[Ii]nitializ ]]; then
+        echo "⚙️  MODEL INIT: $clean_line"
+    
+    # Token generation and streaming
+    elif [[ "$clean_line" =~ [Tt]oken|[Gg]enerat|[Ss]tream ]]; then
+        echo "🔤 TOKEN STREAM: $clean_line"
+    
+    # Code-related activities
+    elif [[ "$clean_line" =~ [Cc]ode|[Pp]rogram|[Ss]cript|[Ff]unction ]]; then
+        echo "💻 CODE OPERATION: $clean_line"
+    
+    # Testing and validation
+    elif [[ "$clean_line" =~ [Tt]est|[Vv]alidat|[Cc]heck|[Vv]erif ]]; then
+        echo "🧪 TESTING PHASE: $clean_line"
+    
+    # Git operations
+    elif [[ "$clean_line" =~ [Gg]it|[Cc]ommit|[Pp]ush|[Bb]ranch ]]; then
+        echo "📚 GIT OPERATION: $clean_line"
+    
+    # File system operations
+    elif [[ "$clean_line" =~ [Ff]ile|[Dd]irectory|[Pp]ath|[Ww]rite ]]; then
+        echo "📁 FILESYSTEM: $clean_line"
+    
+    # Memory and database operations
+    elif [[ "$clean_line" =~ [Mm]emory|[Dd]atabase|[Ss]ql|[Qq]uery ]]; then
+        echo "💾 MEMORY/DB: $clean_line"
+    
+    # Network and API calls
+    elif [[ "$clean_line" =~ [Hh]ttp|[Aa]pi|[Rr]equest|[Ww]eb ]]; then
+        echo "🌐 NETWORK/API: $clean_line"
+    
+    # Success messages
+    elif [[ "$clean_line" =~ [Ss]uccess|[Cc]omplet|[Dd]one|[Ff]inish ]]; then
+        echo "✅ SUCCESS: $clean_line"
+    
+    # Error messages
+    elif [[ "$clean_line" =~ [Ee]rror|[Ff]ail|[Ww]arn|[Ii]ssue ]]; then
+        echo "❌ ERROR: $clean_line"
+    
+    # Configuration and settings
+    elif [[ "$clean_line" =~ [Cc]onfig|[Ss]etting|[Pp]reference ]]; then
+        echo "⚙️  CONFIG: $clean_line"
+    
+    # User input and prompts
+    elif [[ "$clean_line" =~ [Uu]ser|[Pp]rompt|[Ii]nput|[Qq]uest ]]; then
+        echo "👤 USER INPUT: $clean_line"
+    
+    # Phase transitions and major sections
+    elif [[ "$clean_line" =~ [Pp]hase|[Ss]tage|[Ss]tep|[Ll]evel ]]; then
+        echo "🚀 PHASE TRANSITION: $clean_line"
+    
+    # JSON and data structures
+    elif [[ "$clean_line" =~ ^\{.*\}$ ]] || [[ "$clean_line" =~ [Jj]son|[Dd]ata ]]; then
+        echo "📊 DATA STRUCTURE: $clean_line"
+    
+    # Numeric patterns (stats, metrics)
+    elif [[ "$clean_line" =~ [0-9]+(ms|s|MB|GB|%) ]]; then
+        echo "📈 METRICS: $clean_line"
+    
+    # Default categorization based on content
+    else
+        # Check if it's likely AI-generated text (complete sentences)
+        if [[ "$clean_line" =~ ^[A-Z][a-z].*[.!?]$ ]] && [[ ${#clean_line} -gt 20 ]]; then
+            echo "🗣️  AI RESPONSE: $clean_line"
+        elif [[ "$clean_line" =~ ^[A-Z][A-Z_ ]+: ]]; then
+            echo "📋 LABELED OUTPUT: $clean_line"
+        elif [[ -n "$clean_line" ]]; then
+            echo "🔧 SYSTEM: $clean_line"
+        fi
+    fi
+}
+
+echo "=================================================="
+echo "🤖 AI TOKEN EXCHANGE ANALYZER"
+echo "=================================================="
+echo "Script: $SCRIPT_TO_DEBUG"
+echo "Arguments: $@"
+echo "Start Time: $(date)"
+echo "=================================================="
+echo ""
+
+# Buffer for multi-line context
+buffer=""
+in_multiline=0
+
+# Process each line with context awareness
+"$SCRIPT_TO_DEBUG" "$@" 2>&1 | while IFS= read -r line; do
+    # Remove colors and store clean version
+    clean_line=$(remove_colors "$line")
+    
+    # Skip empty lines but track context
+    if [[ -z "$clean_line" ]]; then
+        if [[ $in_multiline -eq 1 ]]; then
+            echo "📄 MULTI-LINE COMPLETE: $buffer"
+            buffer=""
+            in_multiline=0
+        fi
+        continue
+    fi
+    
+    # Check if this looks like the start of a multi-line block
+    if [[ "$clean_line" =~ ^[A-Z][a-z].*[^.!?]$ ]] && [[ ${#clean_line} -lt 100 ]]; then
+        if [[ $in_multiline -eq 0 ]]; then
+            buffer="$clean_line"
+            in_multiline=1
+        else
+            buffer="$buffer | $clean_line"
+        fi
+        continue
+    fi
+    
+    # Process single line or complete multi-line block
+    if [[ $in_multiline -eq 1 ]]; then
+        analyze_line "$buffer"
+        buffer=""
+        in_multiline=0
+    fi
+    
+    # Analyze the current line
+    analyze_line "$clean_line"
+    
+    # Add small delay to make streaming visible
+    sleep 0.01
+done
+
+echo ""
+echo "=================================================="
+echo "📊 ANALYSIS COMPLETE"
+echo "End Time: $(date)"
+echo "=================================================="
+
+# Summary function (would need to capture and analyze all output)
+echo ""
+echo "SUMMARY CATEGORIES:"
+echo "🤔 OLLAMA INTERNAL - Model's internal reasoning"
+echo "🧠 COGNITIVE PROCESS - AI thinking and planning"  
+echo "⚙️  MODEL INIT - Model loading and setup"
+echo "🔤 TOKEN STREAM - Token generation process"
+echo "💻 CODE OPERATION - Code-related activities"
+echo "🧪 TESTING PHASE - Validation and testing"
+echo "📚 GIT OPERATION - Version control operations"
+echo "📁 FILESYSTEM - File and directory operations"
+echo "💾 MEMORY/DB - Memory and database interactions"
+echo "🌐 NETWORK/API - Web and API communications"
+echo "✅ SUCCESS - Completed operations"
+echo "❌ ERROR - Errors and warnings"
+echo "⚙️  CONFIG - Configuration changes"
+echo "👤 USER INPUT - User interactions"
+echo "🚀 PHASE TRANSITION - Major process changes"
+echo "📊 DATA STRUCTURE - JSON and data handling"
+echo "📈 METRICS - Performance statistics"
+echo "🗣️  AI RESPONSE - Generated text responses"
+echo "📋 LABELED OUTPUT - Formatted output"
+echo "🔧 SYSTEM - General system messages"

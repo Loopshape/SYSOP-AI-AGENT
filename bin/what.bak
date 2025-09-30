@@ -1,0 +1,500 @@
+#!/usr/bin/env python3
+"""
+0xA GitAgent Assembly - Self-Contained with Fallback
+- Automatic Ollama management
+- Fallback analysis when AI unavailable
+- Robust error handling
+"""
+
+import os
+import sys
+import subprocess
+import time
+import uuid
+import socket
+import importlib
+import json
+import threading
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Callable
+from enum import Enum
+
+# ==================== OLLAMA MANAGER ====================
+
+class OllamaManager:
+    """Manage Ollama server lifecycle"""
+    
+    @staticmethod
+    def is_ollama_installed():
+        """Check if Ollama is installed"""
+        try:
+            result = subprocess.run(['which', 'ollama'], capture_output=True)
+            return result.returncode == 0
+        except:
+            return False
+    
+    @staticmethod
+    def is_ollama_running():
+        """Check if Ollama server is running"""
+        try:
+            import requests
+            response = requests.get("http://127.0.0.1:11434/api/tags", timeout=5)
+            return response.status_code == 200
+        except:
+            return False
+    
+    @staticmethod
+    def start_ollama():
+        """Start Ollama server in background"""
+        try:
+            if not OllamaManager.is_ollama_installed():
+                print("❌ Ollama not installed. Please install from https://ollama.ai/")
+                return False
+            
+            print("🚀 Starting Ollama server...")
+            # Start Ollama in background
+            process = subprocess.Popen(
+                ['ollama', 'serve'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            
+            # Wait for server to start
+            for i in range(30):  # 30 second timeout
+                time.sleep(1)
+                if OllamaManager.is_ollama_running():
+                    print("✅ Ollama server started successfully")
+                    return True
+                print(f"⏳ Waiting for Ollama... {i+1}/30")
+            
+            print("❌ Ollama server failed to start within timeout")
+            return False
+            
+        except Exception as e:
+            print(f"❌ Failed to start Ollama: {e}")
+            return False
+    
+    @staticmethod
+    def ensure_model_available(model_name="2244-1"):
+        """Ensure the required model is available"""
+        try:
+            import requests
+            
+            # Check if model exists
+            response = requests.get("http://127.0.0.1:11434/api/tags", timeout=10)
+            if response.status_code == 200:
+                models = response.json().get('models', [])
+                model_exists = any(m['name'].startswith(model_name) for m in models)
+                
+                if not model_exists:
+                    print(f"📥 Pulling model {model_name}...")
+                    pull_response = requests.post(
+                        "http://127.0.0.1:11434/api/pull",
+                        json={"name": model_name},
+                        timeout=300  # 5 minute timeout for pull
+                    )
+                    if pull_response.status_code == 200:
+                        print(f"✅ Model {model_name} pulled successfully")
+                        return True
+                    else:
+                        print(f"❌ Failed to pull model {model_name}")
+                        return False
+                else:
+                    print(f"✅ Model {model_name} already available")
+                    return True
+            return False
+            
+        except Exception as e:
+            print(f"❌ Model check failed: {e}")
+            return False
+
+# ==================== FALLBACK AI ANALYSIS ====================
+
+class FallbackAnalyzer:
+    """Provide basic analysis when AI is unavailable"""
+    
+    @staticmethod
+    def analyze_code_structure(code: str) -> Dict:
+        """Basic code structure analysis"""
+        lines = code.split('\n')
+        analysis = {
+            "line_count": len(lines),
+            "function_count": code.count('def '),
+            "class_count": code.count('class '),
+            "import_count": code.count('import ') + code.count('from '),
+            "comment_density": sum(1 for line in lines if line.strip().startswith('#')) / max(1, len(lines)),
+            "complexity_indicators": {
+                "nested_loops": code.count('for ') + code.count('while '),
+                "conditionals": code.count('if ') + code.count('elif ') + code.count('else:'),
+                "function_calls": code.count('(') - code.count('def ') - code.count('class ')
+            }
+        }
+        return analysis
+    
+    @staticmethod
+    def generate_recommendations(analysis: Dict) -> List[str]:
+        """Generate basic recommendations based on analysis"""
+        recommendations = []
+        
+        if analysis['line_count'] > 200:
+            recommendations.append("Consider breaking this into smaller functions/modules")
+        
+        if analysis['comment_density'] < 0.1:
+            recommendations.append("Add more comments for better documentation")
+        
+        if analysis['complexity_indicators']['nested_loops'] > 5:
+            recommendations.append("Reduce nested loops for better readability")
+        
+        if analysis['function_count'] == 0 and analysis['line_count'] > 50:
+            recommendations.append("Consider organizing code into functions")
+        
+        return recommendations
+
+# ==================== ENHANCED AI CLIENT ====================
+
+class RobustAIClient:
+    """AI client with fallback capabilities"""
+    
+    def __init__(self):
+        self.ai_available = False
+        self.initialized = False
+    
+    def initialize(self):
+        """Initialize AI client with automatic Ollama management"""
+        print("🔧 Initializing AI client...")
+        
+        # Check if Ollama is running
+        if OllamaManager.is_ollama_running():
+            print("✅ Ollama server is running")
+            self.ai_available = True
+        else:
+            print("⚠️ Ollama not running, attempting to start...")
+            if OllamaManager.start_ollama():
+                self.ai_available = True
+            else:
+                print("❌ Could not start Ollama, using fallback analysis")
+                self.ai_available = False
+        
+        # Ensure model is available if AI is available
+        if self.ai_available:
+            self.ai_available = OllamaManager.ensure_model_available("2244-1")
+        
+        self.initialized = True
+        return self.ai_available
+    
+    def analyze_code(self, code: str, context: str = "") -> Dict:
+        """Analyze code with AI or fallback"""
+        if not self.initialized:
+            self.initialize()
+        
+        if self.ai_available:
+            return self._analyze_with_ai(code, context)
+        else:
+            return self._analyze_with_fallback(code, context)
+    
+    def _analyze_with_ai(self, code: str, context: str) -> Dict:
+        """Analyze code using Ollama AI"""
+        try:
+            import requests
+            
+            prompt = f"""
+            Analyze this code from the 0xA repository:
+            
+            Context: {context}
+            
+            Code:
+            ```python
+            {code[:3000]}  # Limit code length
+            ```
+            
+            Provide analysis in JSON format with:
+            - quality_assessment (string)
+            - improvements (list of strings)
+            - security_considerations (list of strings)
+            - integration_suggestions (list of strings)
+            """
+            
+            response = requests.post(
+                "http://127.0.0.1:11434/api/generate",
+                json={
+                    "model": "2244-1",
+                    "prompt": prompt,
+                    "stream": False
+                },
+                timeout=120  # 2 minute timeout
+            )
+            
+            if response.status_code == 200:
+                ai_response = response.json().get("response", "")
+                return self._parse_ai_response(ai_response)
+            else:
+                print(f"❌ AI request failed: {response.status_code}")
+                return self._analyze_with_fallback(code, context)
+                
+        except Exception as e:
+            print(f"❌ AI analysis failed: {e}")
+            return self._analyze_with_fallback(code, context)
+    
+    def _analyze_with_fallback(self, code: str, context: str) -> Dict:
+        """Fallback analysis when AI is unavailable"""
+        print("⚠️ Using fallback analysis (AI unavailable)")
+        
+        analysis = FallbackAnalyzer.analyze_code_structure(code)
+        recommendations = FallbackAnalyzer.generate_recommendations(analysis)
+        
+        return {
+            "quality_assessment": "Basic structural analysis completed",
+            "improvements": recommendations,
+            "security_considerations": ["Review manually for security issues"],
+            "integration_suggestions": ["Consider integrating with existing 0xA components"],
+            "fallback_used": True,
+            "structural_analysis": analysis
+        }
+    
+    def _parse_ai_response(self, response: str) -> Dict:
+        """Parse AI response, handling both JSON and text formats"""
+        try:
+            # Try to parse as JSON
+            if response.strip().startswith('{'):
+                return json.loads(response)
+            else:
+                # Extract JSON from text response
+                start = response.find('{')
+                end = response.rfind('}') + 1
+                if start != -1 and end != 0:
+                    return json.loads(response[start:end])
+        except:
+            pass
+        
+        # Fallback if JSON parsing fails
+        return {
+            "quality_assessment": response[:500] + "..." if len(response) > 500 else response,
+            "improvements": ["AI analysis completed"],
+            "security_considerations": ["Review code manually"],
+            "integration_suggestions": ["Integrate with 0xA architecture"],
+            "raw_response": response
+        }
+
+# ==================== ENHANCED ASSEMBLY CONTROLLER ====================
+
+class ZeroXAAssembly:
+    """Enhanced 0xA Assembly with robust AI handling"""
+    
+    def __init__(self, repo_path: str = "."):
+        self.repo_path = os.path.abspath(repo_path)
+        self.ai_client = RobustAIClient()
+        self.log_file = Path(".gitagent_0xa_enhanced.log")
+        self.results = {}
+        
+    def log(self, message: str, level: str = "INFO"):
+        """Enhanced logging"""
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[0xA] [{timestamp}] [{level}] {message}"
+        
+        # Color coding for terminal
+        if level == "ERROR":
+            print(f"❌ {log_entry}")
+        elif level == "WARN":
+            print(f"⚠️ {log_entry}")
+        elif level == "SUCCESS":
+            print(f"✅ {log_entry}")
+        else:
+            print(f"ℹ️ {log_entry}")
+        
+        with open(self.log_file, "a") as f:
+            f.write(log_entry + "\n")
+    
+    def analyze_repository_structure(self):
+        """Analyze repository structure"""
+        self.log("Analyzing repository structure...")
+        
+        repo_path = Path(self.repo_path)
+        structure = {
+            "python_files": [],
+            "shell_scripts": [],
+            "config_files": [],
+            "documentation": [],
+            "total_size": 0
+        }
+        
+        for root, dirs, files in os.walk(repo_path):
+            for file in files:
+                file_path = Path(root) / file
+                try:
+                    if file.endswith('.py'):
+                        structure["python_files"].append(str(file_path.relative_to(repo_path)))
+                    elif file.endswith('.sh'):
+                        structure["shell_scripts"].append(str(file_path.relative_to(repo_path)))
+                    elif file.endswith(('.json', '.yaml', '.yml', '.toml', '.conf')):
+                        structure["config_files"].append(str(file_path.relative_to(repo_path)))
+                    elif file.endswith(('.md', '.rst', '.txt')):
+                        structure["documentation"].append(str(file_path.relative_to(repo_path)))
+                    
+                    structure["total_size"] += file_path.stat().st_size
+                    
+                except Exception as e:
+                    continue
+        
+        return structure
+    
+    def analyze_sample_code(self):
+        """Analyze sample code from the repository"""
+        self.log("Analyzing code samples...")
+        
+        repo_path = Path(self.repo_path)
+        python_files = list(repo_path.glob("**/*.py"))
+        
+        analyses = {}
+        
+        for py_file in python_files[:3]:  # Analyze first 3 Python files
+            try:
+                with open(py_file, 'r', encoding='utf-8') as f:
+                    code_content = f.read()
+                
+                self.log(f"Analyzing {py_file.name}...")
+                analysis = self.ai_client.analyze_code(
+                    code_content, 
+                    f"File: {py_file.relative_to(repo_path)}"
+                )
+                
+                analyses[str(py_file.relative_to(repo_path))] = analysis
+                time.sleep(1)  # Rate limiting
+                
+            except Exception as e:
+                self.log(f"Failed to analyze {py_file}: {e}", "ERROR")
+                continue
+        
+        return analyses
+    
+    def generate_comprehensive_report(self):
+        """Generate comprehensive analysis report"""
+        self.log("Generating comprehensive report...")
+        
+        report = {
+            "metadata": {
+                "timestamp": time.time(),
+                "repository_path": self.repo_path,
+                "ai_available": self.ai_client.ai_available
+            },
+            "repository_structure": self.analyze_repository_structure(),
+            "code_analysis": self.analyze_sample_code(),
+            "recommendations": self.generate_overall_recommendations()
+        }
+        
+        return report
+    
+    def generate_overall_recommendations(self):
+        """Generate overall recommendations"""
+        recommendations = []
+        
+        structure = self.results.get("repository_structure", {})
+        
+        if len(structure.get("python_files", [])) == 0:
+            recommendations.append("Consider adding Python scripts for automation")
+        
+        if len(structure.get("documentation", [])) == 0:
+            recommendations.append("Add documentation files (README.md, etc.)")
+        
+        if structure.get("total_size", 0) > 10_000_000:  # 10MB
+            recommendations.append("Consider optimizing repository size")
+        
+        recommendations.append("Ensure all scripts have proper execution permissions")
+        recommendations.append("Add .gitignore file if missing")
+        recommendations.append("Consider adding CI/CD configuration")
+        
+        return recommendations
+    
+    def run(self):
+        """Main execution flow"""
+        self.log("🚀 Starting Enhanced 0xA GitAgent Assembly")
+        self.log(f"Repository: {self.repo_path}")
+        
+        # Initialize AI client
+        self.log("Initializing AI capabilities...")
+        ai_ready = self.ai_client.initialize()
+        
+        if ai_ready:
+            self.log("AI analysis enabled", "SUCCESS")
+        else:
+            self.log("Using fallback analysis (AI unavailable)", "WARN")
+        
+        # Perform analysis
+        try:
+            self.results = self.generate_comprehensive_report()
+            
+            # Save report
+            report_path = Path("0xa_enhanced_analysis_report.json")
+            with open(report_path, 'w') as f:
+                json.dump(self.results, f, indent=2)
+            
+            self.log(f"✅ Analysis completed successfully", "SUCCESS")
+            self.log(f"📊 Report saved to: {report_path}")
+            
+            # Print summary
+            structure = self.results["repository_structure"]
+            self.log(f"📁 Found {len(structure['python_files'])} Python files")
+            self.log(f"📜 Found {len(structure['shell_scripts'])} shell scripts")
+            self.log(f"📋 Found {len(structure['config_files'])} config files")
+            self.log(f"📚 Found {len(structure['documentation'])} documentation files")
+            
+            return True
+            
+        except Exception as e:
+            self.log(f"❌ Analysis failed: {str(e)}", "ERROR")
+            return False
+
+# ==================== QUICK START ====================
+
+def quick_install_ollama():
+    """Provide instructions for installing Ollama"""
+    print("\n🔧 Ollama Installation Quick Guide:")
+    print("1. Visit https://ollama.ai/ and download Ollama")
+    print("2. Install it on your system")
+    print("3. Or use curl install:")
+    print("   curl -fsSL https://ollama.ai/install.sh | sh")
+    print("4. Then run this script again")
+    print("\nFor now, the script will use fallback analysis.")
+
+# ==================== MAIN EXECUTION ====================
+
+def main():
+    """Command line interface"""
+    if len(sys.argv) > 1 and sys.argv[1] in ['-h', '--help']:
+        print("""
+0xA GitAgent Assembly - Enhanced Version
+
+Usage:
+  python3 gitagent_0xa_enhanced.py [repository_path]
+  
+Options:
+  -h, --help    Show this help message
+  -i, --install Show Ollama installation guide
+
+Features:
+  - Automatic Ollama management
+  - Fallback analysis when AI unavailable
+  - Comprehensive repository analysis
+  - JSON report generation
+        """)
+        return
+    
+    if len(sys.argv) > 1 and sys.argv[1] in ['-i', '--install']:
+        quick_install_ollama()
+        return
+    
+    repo_path = sys.argv[1] if len(sys.argv) > 1 else "."
+    
+    # Check if path exists
+    if not os.path.exists(repo_path):
+        print(f"❌ Path does not exist: {repo_path}")
+        sys.exit(1)
+    
+    # Run the assembly
+    assembly = ZeroXAAssembly(repo_path)
+    success = assembly.run()
+    
+    sys.exit(0 if success else 1)
+
+if __name__ == "__main__":
+    main()
