@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# 2244 Hybrid Agent v19 - NAT-aware, Streaming, Syntax-highlighted
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# --- CONFIG ---
+AI_HOME="${AI_HOME:-$HOME/.ai_agent}"
+PROJECTS_DIR="${PROJECTS_DIR:-$HOME/ai_projects}"
+LOG_FILE="$AI_HOME/ai.log"
+DEFAULT_MODEL="llama3.1:8b"
+OLLAMA_BIN="$(command -v ollama || echo 'ollama')"
+MEMORY_DB="$AI_HOME/memory.db"
+CONFIG_DB="$AI_HOME/config.db"
+
+MODEL_ORDER=("core" "2244-1" "loop")
+AI_AGENT_MODEL="$DEFAULT_MODEL"
+AI_TEMPERATURE="0.7"
+AI_TOP_P="0.9"
+AI_SEED=""
+
+# Colors
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'; NC='\033[0m'
+
+ICON_SUCCESS="✅"; ICON_WARN="⚠️"; ICON_ERROR="❌"; ICON_INFO="ℹ️"; ICON_NET="🌐"
+
+# --- LOGGING ---
+log() { local msg="$*"; printf "${BLUE}${ICON_INFO} [%s] %s${NC}\n" "$(date '+%T')" "$msg" | tee -a "$LOG_FILE"; }
+log_info() { log "$*"; }
+log_success() { printf "${GREEN}${ICON_SUCCESS} [%s] %s${NC}\n" "$(date '+%T')" "$*" | tee -a "$LOG_FILE"; }
+log_warn() { printf "${YELLOW}${ICON_WARN} [%s] WARN: %s${NC}\n" "$(date '+%T')" "$*" | tee -a "$LOG_FILE"; }
+log_error() { printf "${RED}${ICON_ERROR} [%s] ERROR: %s${NC}\n" "$(date '+%T')" "$*" | tee -a "$LOG_FILE"; exit 1; }
+
+# --- DATABASE ---
+sqlite_escape() { echo "$1" | sed "s/'/''/g"; }
+init_db() {
+    sqlite3 "$CONFIG_DB" "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);" 2>/dev/null || true
+    sqlite3 "$MEMORY_DB" "CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY, prompt TEXT, response TEXT, hash TEXT);" 2>/dev/null || true
+}
+set_config() { sqlite3 "$CONFIG_DB" "INSERT OR REPLACE INTO config (key, value) VALUES ('$(sqlite_escape "$1")','$(sqlite_escape "$2")');"; log_success "Config set: $1=$2"; }
+get_config() { sqlite3 "$CONFIG_DB" "SELECT value FROM config WHERE key='$(sqlite_escape "$1")';" 2>/dev/null; }
+
+load_config_values() {
+    AI_AGENT_MODEL="${AI_AGENT_MODEL:-$(get_config agent_model || echo "$DEFAULT_MODEL")}"
+    AI_TEMPERATURE="${AI_TEMPERATURE:-$(get_config temperature || echo "0.7")}"
+    AI_TOP_P="${AI_TOP_P:-$(get_config top_p || echo "0.9")}"
+    AI_SEED="${AI_SEED:-$(get_config seed || echo "")}"
+}
+
+# --- NAT DETECTION ---
+detect_nat() {
+    log_info "${ICON_NET} Detecting public and local IPs..."
+    local result
+    result=$(python3 - << 'EOF'
+import socket, sys
+try:
+    import stun
+except ImportError:
+    print("error: Python module 'stun' not found", file=sys.stderr)
+    sys.exit(1)
+
+def try_stun(family):
+    sock = None
+    try:
+        sock = socket.socket(family, socket.SOCK_DGRAM)
+        sock.settimeout(2)
+        _, public_ip, _ = stun.get_ip_info(stun_host="stun.l.google.com", stun_port=19302, sock=sock)
+        local_ip = sock.getsockname()[0]
+        return public_ip, local_ip
+    except Exception:
+        return None, None
+    finally:
+        if sock: sock.close()
+
+public_ip, local_ip = try_stun(socket.AF_INET6)
+if not public_ip or public_ip.startswith("127"):
+    public_ip, local_ip = try_stun(socket.AF_INET)
+if not local_ip:
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+    except: local_ip = "127.0.0.1"
+if public_ip is None or public_ip.startswith("127"):
+    public_ip = "N/A (local-only)"
+print(f"{public_ip}|{local_ip}")
+EOF
+)
+    echo "$result"
+}
+
+# --- CODE HIGHLIGHTING ---
+highlight_code(){
+    local code="$1"
+    if command -v bat &> /dev/null; then
+        echo "$code" | bat --paging=never --color=always
+    elif command -v pygmentize &> /dev/null; then
+        echo "$code" | pygmentize -f terminal -O style=monokai
+    else
+        echo -e "\033[1;34m--- CODE BLOCK ---\033[0m"
+        echo "$code"
+        echo -e "\033[1;34m-----------------\033[0m"
+    fi
+}
+
+# --- MEMORY ---
+add_to_memory() { sqlite3 "$MEMORY_DB" "INSERT INTO memories (prompt,response) VALUES ('$(sqlite_escape "$1")','$(sqlite_escape "$2")');" 2>/dev/null || log_warn "Failed to store memory"; }
+search_memory() { local q="$1" l="${2:-5}"; sqlite3 -header -column "$MEMORY_DB" "SELECT timestamp,prompt,response FROM memories WHERE prompt LIKE '%$(sqlite_escape "$q")%' OR response LIKE '%$(sqlite_escape "$q")%' ORDER BY timestamp DESC LIMIT $l;" 2>/dev/null || echo "No relevant memories found."; }
+
+# --- WORKER (Streaming) ---
+run_worker_interactive() {
+    local worker="$1" model="$2" system_prompt="$3" user_prompt="$4"
+    local temp="${AI_TEMPERATURE:-0.7}"
+    local top_p="${AI_TOP_P:-0.9}"
+    local seed="${AI_SEED:-}"
+
+    if ! curl -s http://localhost:11434/api/tags > /dev/null; then
+        log_warn "${worker} Ollama service not available, simulating output..."
+        echo "[${worker} simulated response for prompt]"
+        return
+    fi
+
+    local payload
+    payload=$(jq -n \
+        --arg model "$model" \
+        --arg system "$system_prompt" \
+        --arg prompt "$user_prompt" \
+        --argjson temperature "$temp" \
+        --argjson top_p "$top_p" \
+        '{model:$model, system:$system, prompt:$prompt, options:{temperature:$temperature,top_p:$top_p}, stream:true}' 2>/dev/null)
+
+    # Streaming response
+    curl -s -X POST http://localhost:11434/api/generate -H "Content-Type: application/json" -d "$payload" | while read -r line; do
+        local out=$(echo "$line" | jq -r '.response? // empty' 2>/dev/null)
+        if [[ -n "$out" ]]; then printf "%s" "$out"; fi
+    done
+}
+
+# --- TRIUMVIRATE AGENT ---
+run_triumvirate_agent(){
+    local prompt="$1"
+    log_info "Starting Triumvirate for prompt: $prompt"
+
+    local context
+    context=$(search_memory "$prompt" 3)
+    local final_answer=""
+
+    for ((i=1;i<=3;i++)); do
+        echo -e "${CYAN}--- Round $i ---${NC}"
+
+        local messenger=$(run_worker_interactive "Messenger" "$AI_AGENT_MODEL" "Analyze prompt" "$prompt")
+        local combinator=$(run_worker_interactive "Combinator" "$AI_AGENT_MODEL" "Plan based on Messenger" "$prompt\n$messenger")
+        local trader=$(run_worker_interactive "Trader" "$AI_AGENT_MODEL" "Execute plan" "$prompt\n$messenger\n$combinator")
+
+        if [[ "$trader" == *"[FINAL_ANSWER]"* ]]; then
+            final_answer="$trader"
+            break
+        fi
+    done
+
+    [[ -z "$final_answer" ]] && final_answer="ERROR: No final answer after 3 rounds"
+    add_to_memory "$prompt" "$final_answer"
+
+    # Highlight code blocks
+    local code_blocks
+    code_blocks=$(echo "$final_answer" | awk '/^```/{f=!f; next} f')
+    if [[ -n "$code_blocks" ]]; then
+        echo -e "\n${GREEN}🖋 Syntax-highlighted code blocks:${NC}"
+        highlight_code "$code_blocks"
+    fi
+
+    echo -e "\n${GREEN}✅ Final Answer:${NC}\n$final_answer"
+}
+
+# --- MAIN ---
+main() {
+    init_db
+    load_config_values
+    detect_nat
+
+    if [[ $# -eq 0 ]]; then log_error "No prompt provided"; fi
+
+    run_triumvirate_agent "$*"
+}
+
+# --- ENTRY POINT ---
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

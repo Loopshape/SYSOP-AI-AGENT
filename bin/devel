@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+# AI Autonomic Synthesis Platform - Termux Edition
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------------- CONFIG ----------------
+AI_HOME="${AI_HOME:-$HOME/.ai_agent}"
+PROJECTS_DIR="${PROJECTS_DIR:-$HOME/ai_projects}"
+LOG_FILE="$AI_HOME/ai.log"
+CORE_DB="$AI_HOME/agent_core.db"
+MAX_AGENT_LOOPS=5
+MAX_RAM_BYTES=2097152  # 2MB swap threshold
+SWAP_DIR="$AI_HOME/swap"
+HMAC_SECRET_KEY="$AI_HOME/secret.key"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
+PURPLE='\033[0;35m'; CYAN='\033[0;36m'; ORANGE='\033[0;33m'; NC='\033[0m'
+
+ICON_SUCCESS="✅"; ICON_WARN="⚠️"; ICON_ERROR="❌"; ICON_INFO="ℹ️"; ICON_SECURE="🔑"
+ICON_PLAN="📋"; ICON_THINK="🤔"; ICON_EXEC="⚡"; ICON_FEEDBACK="🙋"
+
+# ---------------- LOGGING ----------------
+log(){ local lvl="$1"; local msg="$2"; printf "[%s] %s %s\n" "$lvl" "$(date '+%H:%M:%S')" "$msg" >&2; }
+log_info(){ log "INFO" "$1"; }
+log_warn(){ log "WARN" "$1"; }
+log_error(){ log "ERROR" "$1"; exit 1; }
+log_success(){ log "SUCCESS" "$1"; }
+log_phase(){ log "PHASE" "$1"; }
+log_think(){ log "THINK" "$1"; }
+log_plan(){ log "PLAN" "$1"; }
+log_execute(){ log "EXECUTE" "$1"; }
+
+# ---------------- EMOJI METADATA ----------------
+declare -A EMOJI_METADATA
+init_emoji_map() {
+    EMOJI_METADATA["✅"]='{"name":"SUCCESS","sentiment":"positive"}'
+    EMOJI_METADATA["⚠️"]='{"name":"WARNING","sentiment":"neutral"}'
+    EMOJI_METADATA["❌"]='{"name":"ERROR","sentiment":"negative"}'
+    EMOJI_METADATA["ℹ️"]='{"name":"INFO","sentiment":"neutral"}'
+    EMOJI_METADATA["🔑"]='{"name":"SECURE","sentiment":"positive"}'
+}
+
+# ---------------- INITIALIZATION ----------------
+init_environment(){
+    mkdir -p "$AI_HOME" "$PROJECTS_DIR" "$SWAP_DIR"
+    [[ ! -f "$HMAC_SECRET_KEY" ]] && openssl rand -hex 32 > "$HMAC_SECRET_KEY" && chmod 600 "$HMAC_SECRET_KEY"
+}
+
+calculate_hmac(){ local data="$1"; echo -n "$data" | openssl dgst -sha256 -hmac "$(cat "$HMAC_SECRET_KEY")" | awk '{print $2}'; }
+
+confirm_action(){ local c=""; read -p "$(echo -e "\n${YELLOW}Proposed Action:${NC} ${CYAN}$1${NC}\nApprove? [y/N] ")" -n1 -r c || true; echo; [[ "$c" =~ ^[Yy]$ ]]; }
+
+# ---------------- DATABASE ----------------
+sqlite_escape(){ echo "$1" | sed "s/'/''/g"; }
+init_db(){
+    sqlite3 "$CORE_DB" "CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY, prompt_hash TEXT, prompt TEXT, response_ref TEXT);"
+    sqlite3 "$CORE_DB" "CREATE TABLE IF NOT EXISTS tool_logs (id INTEGER PRIMARY KEY, task_id TEXT, tool_name TEXT, args TEXT, result TEXT);"
+}
+
+store_output_fast(){ local c="$1"; local h=$(echo -n "$c" | sha256sum | cut -d' ' -f1); 
+    if ((${#c} > MAX_RAM_BYTES)); then f="$SWAP_DIR/$h.txt.gz"; echo "$c" | gzip > "$f"; echo "$f"; else echo "$c"; fi
+}
+retrieve_output_fast(){ local r="$1"; [[ -f "$r" ]] && ([[ "$r" == *.gz ]] && gzip -dc "$r" || cat "$r") || echo "$r"; }
+add_to_memory_fast(){ local prompt="$1"; local p="$2"; local ref="$3"; sqlite3 "$CORE_DB" "INSERT INTO memories (prompt_hash,prompt,response_ref) VALUES ('$(sqlite_escape "$prompt")','$(sqlite_escape "$p")','$(sqlite_escape "$ref")');"; }
+
+get_cached_response(){ local p_h=$(echo "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' ' ' | tr -s ' ' | sed 's/^ *//;s/ *$//' | tr ' ' '_'); 
+    sqlite3 "$CORE_DB" "SELECT response_ref FROM memories WHERE prompt_hash='$(sqlite_escape "$p_h")' LIMIT 1;"
+}
+
+# ---------------- TOOLS ----------------
+tool_run_command(){ local dir="$1"; local cmd="$2"; (cd "$dir" && eval "$cmd") 2>&1 || echo "Command failed."; }
+tool_write_file(){ local dir="$1"; local path="$2"; local content="$3"; mkdir -p "$(dirname "$dir/$path")"; echo -e "$content" > "$dir/$path"; echo "File '$path' written."; }
+
+# ---------------- AGI WORKFLOW ----------------
+run_agi_workflow(){
+    local user_prompt="$*"
+    local task_id=$(echo -n "$user_prompt$(date +%s%N)" | sha256sum | cut -c1-16)
+    local project_dir="$PROJECTS_DIR/task-$task_id"
+    mkdir -p "$project_dir"
+    log_success "Project workspace: $project_dir (Task ID: $task_id)"
+
+    local cached_ref; cached_ref=$(get_cached_response "$user_prompt")
+    [[ -n "$cached_ref" ]] && { echo -e "\n--- Cached Final Answer ---\n$(retrieve_output_fast "$cached_ref")"; return; }
+
+    local conversation_history="Initial User Request: $user_prompt"
+    local status="IN_PROGRESS"
+    local last_used_emoji="ℹ️"
+
+    for ((i=1;i<=MAX_AGENT_LOOPS;i++)); do
+        log_phase "AGI Loop $i/$MAX_AGENT_LOOPS"
+        log_think "Messenger analyzing context..."
+        local messenger_output="Analysis: initial mock analysis for Termux low-RAM."
+
+        log_plan "Planning..."
+        local planner_output="Plan mock output for low-RAM device."
+
+        log_execute "Executor deciding..."
+        local final_plan="[FINAL_ANSWER] Mock answer for '$user_prompt'."
+
+        conversation_history="$final_plan"
+        last_used_emoji="✅"
+        status="SUCCESS"
+        break
+    done
+
+    log_phase "AGI Workflow Complete (Status: $status)"
+    local final_ref=$(store_output_fast "$final_plan")
+    add_to_memory_fast "$(echo "$user_prompt" | tr '[:upper:]' '[:lower:]')" "$user_prompt" "$final_ref"
+    echo -e "\n${GREEN}--- Final Answer ---\n${NC}${final_plan}"
+}
+
+# ---------------- MAIN ----------------
+main(){
+    init_environment
+    init_db
+    init_emoji_map
+
+    if [[ $# -eq 0 ]]; then
+        echo -e "${CYAN}No prompt provided. Use: ai \"your task\"${NC}"
+        exit 0
+    fi
+
+    case "$1" in
+        --setup|-s)
+            log_info "Installing dependencies..."
+            pkg install -y git curl nodejs npm sqlite openssl tree
+            log_success "Dependencies installed."
+            ;;
+        --help|-h)
+            echo -e "${GREEN}AI Autonomic Synthesis Platform Termux Edition${NC}\nUsage: ai \"task\""
+            ;;
+        *)
+            run_agi_workflow "$@"
+            ;;
+    esac
+}
+
+main "$@"

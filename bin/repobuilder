@@ -1,0 +1,45 @@
+#!/bin/bash
+set -e
+
+# Paths
+PROJECT_DIR="$HOME/.local_ai"
+LOCAL_BIN="$HOME/.local_ai/bin"
+MANDATORY_AI="$HOME/bin/ai"
+
+# Ensure local bin directory exists
+mkdir -p "$LOCAL_BIN"
+
+echo "[INFO] ==== Starting Incremental Git Build & AGI Workflow ===="
+
+# Pull latest changes
+git -C "$PROJECT_DIR" fetch origin
+git -C "$PROJECT_DIR" reset --hard origin/HEAD
+git -C "$PROJECT_DIR" clean -fd
+
+echo "[SUCCESS] Repository up-to-date."
+
+# Install npm dependencies
+echo "[INFO] Installing npm dependencies..."
+cd "$PROJECT_DIR"
+npm install
+echo "[SUCCESS] Dependencies installed."
+
+# Build project
+if grep -q '"build":' package.json; then
+    echo "[INFO] Running npm build..."
+    npm run build
+    echo "[SUCCESS] Build complete."
+else
+    echo "[WARN] No build script found in package.json, skipping build."
+fi
+
+# Link mandatory AI binary
+if [[ -f "$MANDATORY_AI" && -x "$MANDATORY_AI" ]]; then
+    ln -sf "$MANDATORY_AI" "$LOCAL_BIN/ai"
+    echo "[SUCCESS] AI binary linked at $LOCAL_BIN/ai"
+else
+    echo "[ERROR] Mandatory AI binary not found or not executable at $MANDATORY_AI"
+    exit 1
+fi
+
+echo "[INFO] Workflow complete."

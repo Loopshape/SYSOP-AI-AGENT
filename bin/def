@@ -1,0 +1,490 @@
+#!/usr/bin/env python3
+"""
+0xA GitAgent Assembly - Integrated with OPCODEX0A/0xA
+- Repository-aware component system
+- Integrates with existing 0xA architecture
+- Enhanced NAT and AI capabilities
+"""
+
+import os
+import sys
+import subprocess
+import time
+import uuid
+import socket
+import importlib
+import json
+from pathlib import Path
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Callable
+from enum import Enum
+
+# ==================== 0xA REPOSITORY INTEGRATION ====================
+
+class ZeroxAIntegrator:
+    """Integration with OPCODEX0A/0xA repository structure"""
+    
+    @staticmethod
+    def discover_repo_structure(repo_path: str) -> Dict:
+        """Analyze the 0xA repository structure"""
+        repo_root = Path(repo_path)
+        structure = {
+            "root_files": [],
+            "directories": [],
+            "scripts": [],
+            "configs": [],
+            "documentation": []
+        }
+        
+        if not repo_root.exists():
+            return structure
+        
+        for item in repo_root.iterdir():
+            if item.is_file():
+                structure["root_files"].append(item.name)
+                if item.suffix in ['.sh', '.py', '.js']:
+                    structure["scripts"].append(item.name)
+                elif item.suffix in ['.json', '.yaml', '.yml', '.toml', '.conf']:
+                    structure["configs"].append(item.name)
+            elif item.is_dir():
+                structure["directories"].append(item.name)
+                # Check for common doc directories
+                if item.name.lower() in ['docs', 'documentation', 'readme']:
+                    structure["documentation"].append(item.name)
+        
+        return structure
+    
+    @staticmethod
+    def get_repo_metadata(repo_path: str) -> Dict:
+        """Extract repository metadata"""
+        try:
+            # Get git remote info
+            result = subprocess.check_output(
+                ["git", "remote", "-v"],
+                cwd=repo_path,
+                stderr=subprocess.DEVNULL
+            ).decode().strip()
+            
+            remotes = {}
+            for line in result.split('\n'):
+                if line:
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        remotes[parts[0]] = parts[1]
+            
+            # Get latest commit
+            commit_hash = subprocess.check_output(
+                ["git", "log", "-1", "--pretty=format:%H"],
+                cwd=repo_path,
+                stderr=subprocess.DEVNULL
+            ).decode().strip()
+            
+            return {
+                "remotes": remotes,
+                "latest_commit": commit_hash,
+                "is_0xa_repo": "OPCODEX0A/0xA" in str(remotes)
+            }
+        except:
+            return {"remotes": {}, "latest_commit": "unknown", "is_0xa_repo": False}
+
+# ==================== ENHANCED COMPONENT SYSTEM ====================
+
+class ComponentState(Enum):
+    INIT = 0
+    READY = 1
+    RUNNING = 2
+    ERROR = 3
+    RECOVERING = 4
+
+@dataclass
+class Component:
+    name: str
+    state: ComponentState
+    dependencies: List[str]
+    init_func: Callable
+    run_func: Callable
+    health_check: Callable
+    metadata: Dict
+
+class ComponentRegistry:
+    _components: Dict[str, Component] = {}
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    def register(self, name: str, dependencies: List[str], 
+                 init_func: Callable, run_func: Callable, 
+                 health_check: Callable, metadata: Dict = None):
+        self._components[name] = Component(
+            name=name,
+            state=ComponentState.INIT,
+            dependencies=dependencies,
+            init_func=init_func,
+            run_func=run_func,
+            health_check=health_check,
+            metadata=metadata or {}
+        )
+    
+    def get(self, name: str) -> Optional[Component]:
+        return self._components.get(name)
+    
+    def get_all(self) -> Dict[str, Component]:
+        return self._components.copy()
+
+# ==================== 0xA SPECIFIC COMPONENTS ====================
+
+class ZeroXADependencies:
+    """Component 0xA1: 0xA Specific Dependencies"""
+    
+    @staticmethod
+    def init():
+        print("🔧 [0xA1] Checking 0xA dependencies...")
+        # Check for 0xA specific requirements
+        try:
+            # Common 0xA tools
+            tools = ['git', 'curl', 'wget', 'python3']
+            for tool in tools:
+                result = subprocess.run(['which', tool], capture_output=True)
+                if result.returncode != 0:
+                    print(f"   ⚠️ Missing tool: {tool}")
+            
+            return ComponentState.READY
+        except Exception as e:
+            print(f"   ❌ Dependency check failed: {e}")
+            return ComponentState.ERROR
+    
+    @staticmethod
+    def run():
+        return {"status": "0xA dependencies verified"}
+    
+    @staticmethod
+    def health_check():
+        return ComponentState.READY
+
+class RepositoryAnalyzer:
+    """Component 0xA2: 0xA Repository Analysis"""
+    
+    def __init__(self, repo_path: str):
+        self.repo_path = repo_path
+        self.integrator = ZeroxAIntegrator()
+    
+    def init(self):
+        print("📚 [0xA2] Initializing repository analyzer...")
+        if not os.path.exists(self.repo_path):
+            return ComponentState.ERROR
+        return ComponentState.READY
+    
+    def run(self):
+        """Analyze the 0xA repository structure"""
+        structure = self.integrator.discover_repo_structure(self.repo_path)
+        metadata = self.integrator.get_repo_metadata(self.repo_path)
+        
+        analysis = {
+            "structure": structure,
+            "metadata": metadata,
+            "analysis_timestamp": time.time()
+        }
+        
+        return analysis
+    
+    def health_check(self):
+        return ComponentState.READY if os.path.exists(self.repo_path) else ComponentState.ERROR
+
+class SecurityAuditor:
+    """Component 0xA3: Security Analysis for 0xA"""
+    
+    def __init__(self, repo_path: str):
+        self.repo_path = repo_path
+    
+    def init(self):
+        print("🛡️ [0xA3] Initializing security auditor...")
+        return ComponentState.READY
+    
+    def run(self):
+        """Basic security audit of the repository"""
+        security_report = {
+            "permissions_issues": [],
+            "sensitive_files": [],
+            "executable_scripts": [],
+            "recommendations": []
+        }
+        
+        repo_path = Path(self.repo_path)
+        
+        # Check for suspicious file permissions
+        for root, dirs, files in os.walk(repo_path):
+            for file in files:
+                file_path = Path(root) / file
+                try:
+                    stat = file_path.stat()
+                    if stat.st_mode & 0o777 == 0o777:
+                        security_report["permissions_issues"].append(str(file_path))
+                    
+                    # Check for potential sensitive files
+                    if file_path.suffix in ['.key', '.pem', '.priv', '.secret']:
+                        security_report["sensitive_files"].append(str(file_path))
+                    
+                    # Check executable scripts
+                    if stat.st_mode & 0o111 and file_path.suffix in ['.sh', '.py']:
+                        security_report["executable_scripts"].append(str(file_path))
+                        
+                except Exception as e:
+                    continue
+        
+        return security_report
+    
+    def health_check(self):
+        return ComponentState.READY
+
+class AICodeAnalyzer:
+    """Component 0xA4: AI-Powered Code Analysis"""
+    
+    def __init__(self):
+        self.client = None
+    
+    def init(self):
+        print("🧠 [0xA4] Initializing AI code analyzer...")
+        try:
+            # Try to connect to Ollama
+            import requests
+            response = requests.get("http://localhost:11434/api/tags", timeout=5)
+            if response.status_code == 200:
+                return ComponentState.READY
+            return ComponentState.ERROR
+        except:
+            return ComponentState.ERROR
+    
+    def run(self, code_snippet: str, context: str = ""):
+        """Analyze code using AI model 2244-1"""
+        try:
+            import requests
+            
+            prompt = f"""
+            Analyze the following code from the 0xA repository:
+            
+            Context: {context}
+            
+            Code:
+            ```python
+            {code_snippet}
+            ```
+            
+            Please provide:
+            1. Code quality assessment
+            2. Potential improvements
+            3. Security considerations
+            4. Integration suggestions
+            """
+            
+            response = requests.post(
+                "http://localhost:11434/api/generate",
+                json={"model": "2244-1", "prompt": prompt},
+                timeout=60
+            )
+            
+            if response.status_code == 200:
+                return response.json().get("response", "No analysis available")
+            else:
+                return f"AI analysis failed: {response.status_code}"
+                
+        except Exception as e:
+            return f"AI analysis error: {str(e)}"
+    
+    def health_check(self):
+        try:
+            import requests
+            requests.get("http://localhost:11434/api/tags", timeout=5)
+            return ComponentState.READY
+        except:
+            return ComponentState.ERROR
+
+# ==================== ENHANCED ASSEMBLY CONTROLLER ====================
+
+class ZeroXAAssembly:
+    """0xA-Specific Assembly Controller"""
+    
+    def __init__(self, repo_path: str = "."):
+        self.repo_path = os.path.abspath(repo_path)
+        self.registry = ComponentRegistry()
+        self.setup_0xa_components()
+        self.log_file = Path(".gitagent_0xa.log")
+        
+    def setup_0xa_components(self):
+        """Register 0xA specific components"""
+        
+        # Base dependencies
+        self.registry.register(
+            name="0xa_dependencies",
+            dependencies=[],
+            init_func=ZeroXADependencies.init,
+            run_func=ZeroXADependencies.run,
+            health_check=ZeroXADependencies.health_check,
+            metadata={"version": "0xA1", "purpose": "Dependency management"}
+        )
+        
+        # Repository analyzer
+        self.repo_analyzer = RepositoryAnalyzer(self.repo_path)
+        self.registry.register(
+            name="repository_analyzer",
+            dependencies=["0xa_dependencies"],
+            init_func=self.repo_analyzer.init,
+            run_func=self.repo_analyzer.run,
+            health_check=self.repo_analyzer.health_check,
+            metadata={"version": "0xA2", "purpose": "Repository structure analysis"}
+        )
+        
+        # Security auditor
+        self.security_auditor = SecurityAuditor(self.repo_path)
+        self.registry.register(
+            name="security_auditor",
+            dependencies=["repository_analyzer"],
+            init_func=self.security_auditor.init,
+            run_func=self.security_auditor.run,
+            health_check=self.security_auditor.health_check,
+            metadata={"version": "0xA3", "purpose": "Security analysis"}
+        )
+        
+        # AI analyzer
+        self.ai_analyzer = AICodeAnalyzer()
+        self.registry.register(
+            name="ai_analyzer",
+            dependencies=["0xa_dependencies"],
+            init_func=self.ai_analyzer.init,
+            run_func=self.ai_analyzer.run,
+            health_check=self.ai_analyzer.health_check,
+            metadata={"version": "0xA4", "purpose": "AI-powered code analysis"}
+        )
+    
+    def log(self, message: str, level: str = "INFO"):
+        """Enhanced logging for 0xA"""
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        log_entry = f"[0xA] [{timestamp}] [{level}] {message}"
+        print(log_entry)
+        
+        with open(self.log_file, "a") as f:
+            f.write(log_entry + "\n")
+    
+    def initialize_assembly(self) -> bool:
+        """Initialize all components"""
+        self.log("Initializing 0xA Assembly...")
+        
+        components = self.registry.get_all()
+        initialized = set()
+        max_attempts = 3
+        
+        for attempt in range(max_attempts):
+            for name, component in components.items():
+                if name in initialized:
+                    continue
+                
+                deps_ready = all(dep in initialized for dep in component.dependencies)
+                if deps_ready:
+                    result = component.init_func()
+                    if result == ComponentState.READY:
+                        component.state = ComponentState.READY
+                        initialized.add(name)
+                        self.log(f"Component {name} initialized successfully")
+                    else:
+                        self.log(f"Component {name} initialization failed", "ERROR")
+        
+        success = len(initialized) == len(components)
+        if success:
+            self.log("All components initialized successfully")
+        else:
+            self.log(f"Initialization incomplete: {len(initialized)}/{len(components)} components ready", "WARN")
+        
+        return success
+    
+    def execute_0xa_analysis(self):
+        """Execute comprehensive 0xA repository analysis"""
+        self.log("Starting 0xA repository analysis...")
+        
+        # Repository structure analysis
+        repo_analysis = self.registry.get("repository_analyzer").run_func()
+        self.log(f"Repository structure analyzed: {len(repo_analysis['structure']['scripts'])} scripts found")
+        
+        # Security audit
+        security_report = self.registry.get("security_auditor").run_func()
+        self.log(f"Security audit completed: {len(security_report['permissions_issues'])} issues found")
+        
+        # Sample code analysis (analyze first Python file found)
+        python_files = [f for f in repo_analysis['structure']['scripts'] if f.endswith('.py')]
+        if python_files:
+            sample_file = python_files[0]
+            sample_path = Path(self.repo_path) / sample_file
+            if sample_path.exists():
+                with open(sample_path, 'r') as f:
+                    code_content = f.read()[:1000]  # First 1000 chars
+                
+                ai_analysis = self.ai_analyzer.run(code_content, f"Analysis of {sample_file}")
+                self.log(f"AI analysis of {sample_file} completed")
+        
+        return {
+            "repository_analysis": repo_analysis,
+            "security_audit": security_report,
+            "timestamp": time.time()
+        }
+    
+    def generate_report(self, analysis_results: Dict):
+        """Generate a comprehensive report"""
+        report_path = Path("0xa_analysis_report.json")
+        
+        with open(report_path, 'w') as f:
+            json.dump(analysis_results, f, indent=2)
+        
+        self.log(f"Analysis report generated: {report_path}")
+        return report_path
+    
+    def run(self):
+        """Main execution flow"""
+        self.log("🚀 0xA GitAgent Assembly starting...")
+        self.log(f"Target repository: {self.repo_path}")
+        
+        # Initialize
+        if not self.initialize_assembly():
+            self.log("Assembly initialization failed", "ERROR")
+            return False
+        
+        # Execute analysis
+        try:
+            results = self.execute_0xa_analysis()
+            report_path = self.generate_report(results)
+            
+            self.log(f"✅ 0xA analysis completed successfully")
+            self.log(f"📊 Report saved to: {report_path}")
+            
+            # Print summary
+            repo_meta = results['repository_analysis']['metadata']
+            if repo_meta['is_0xa_repo']:
+                self.log("🎯 This is a genuine 0xA repository!")
+            else:
+                self.log("⚠️  This may not be the official 0xA repository")
+            
+            return True
+            
+        except Exception as e:
+            self.log(f"❌ Analysis failed: {str(e)}", "ERROR")
+            return False
+
+# ==================== CLI INTERFACE ====================
+
+def main():
+    """Command line interface"""
+    repo_path = sys.argv[1] if len(sys.argv) > 1 else "."
+    
+    # Check if we're in a git repository
+    if not os.path.exists(os.path.join(repo_path, ".git")):
+        print("❌ Not a git repository. Please run this in a git repository or specify path.")
+        sys.exit(1)
+    
+    # Run the assembly
+    assembly = ZeroXAAssembly(repo_path)
+    success = assembly.run()
+    
+    sys.exit(0 if success else 1)
+
+if __name__ == "__main__":
+    main()
