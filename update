@@ -1,0 +1,55 @@
+#!/bin/bash
+# repo.sh — Incremental Git Build & AGI Workflow (SSH + main branch)
+
+set -euo pipefail
+
+REPO_DIR="$HOME/.local_ai"
+BIN_DIR="$REPO_DIR/bin"
+DEFAULT_BRANCH="main"
+
+echo "[INFO] $(date +%H:%M:%S) ==== Starting Incremental Git Build & AGI Workflow ===="
+
+# 1. Ensure SSH key is loaded
+if ! ssh-add -l | grep -q "LOOPSHAPE"; then
+    echo "[INFO] SSH key not loaded, attempting to add..."
+    ssh-add "$HOME/.ssh/id_rsa" || { echo "[ERROR] Failed to add SSH key."; exit 1; }
+fi
+
+# 2. Ensure repo exists
+if [ ! -d "$REPO_DIR/.git" ]; then
+    echo "[INFO] Cloning repository via SSH..."
+    git clone git@github.com:Loopshape/SYSOP-AI-AGENT.git "$REPO_DIR"
+fi
+
+cd "$REPO_DIR"
+
+# 3. Fetch latest changes
+echo "[INFO] $(date +%H:%M:%S) Fetching latest changes from remote..."
+git fetch origin "$DEFAULT_BRANCH"
+
+# 4. Reset to latest main branch
+git reset --hard "origin/$DEFAULT_BRANCH"
+echo "[SUCCESS] $(date +%H:%M:%S) Repository is up-to-date."
+
+# 5. Install npm dependencies
+echo "[INFO] $(date +%H:%M:%S) Installing npm dependencies..."
+npm install
+echo "[SUCCESS] $(date +%H:%M:%S) Dependencies installed."
+
+# 6. Run Vite build
+echo "[INFO] $(date +%H:%M:%S) Building project with Vite..."
+npm run build
+echo "[SUCCESS] $(date +%H:%M:%S) Vite build complete."
+
+# 7. Check AI binary
+if [ ! -x "$BIN_DIR/ai" ]; then
+    echo "[ERROR] AI binary not found or not executable: $BIN_DIR/ai"
+    exit 1
+fi
+
+# 8. Link bin directory to ~/.local_ai/bin
+mkdir -p "$BIN_DIR"
+ln -sfn "$REPO_DIR/bin/"* "$BIN_DIR/"
+echo "[INFO] $(date +%H:%M:%S) Bin directory linked."
+
+echo "[SUCCESS] $(date +%H:%M:%S) Incremental Git Build & AGI Workflow completed successfully."

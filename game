@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------------- CONFIG ----------------
+PROJECT_DIR="${PROJECT_DIR:-$HOME/.local_ai}"
+REMOTE_REPO="git@github.com:Loopshape/SYSOP-AI-AGENT.git"
+NODE_MODULES="$PROJECT_DIR/node_modules"
+BUILD_DIR="$PROJECT_DIR/dist"
+
+# ---------------- LOGGING ----------------
+log(){ local lvl="$1"; local msg="$2"; printf "[%s] %s %s\n" "$lvl" "$(date '+%H:%M:%S')" "$msg"; }
+log_info(){ log "INFO" "$1"; }
+log_warn(){ log "WARN" "$1"; }
+log_error(){ log "ERROR" "$1"; exit 1; }
+log_success(){ log "SUCCESS" "$1"; }
+
+# ---------------- FUNCTIONS ----------------
+init_git(){
+    if [[ ! -d "$PROJECT_DIR/.git" ]]; then
+        log_info "Initializing git repo..."
+        git init "$PROJECT_DIR"
+        git -C "$PROJECT_DIR" remote add origin "$REMOTE_REPO"
+    else
+        log_info "Git repo already exists."
+    fi
+}
+
+update_repo(){
+    log_info "Fetching latest changes..."
+    git -C "$PROJECT_DIR" fetch --all
+    git -C "$PROJECT_DIR" reset --hard origin/master || git -C "$PROJECT_DIR" reset --hard origin/main
+    log_success "Repository up-to-date."
+}
+
+install_deps(){
+    log_info "Installing npm dependencies..."
+    cd "$PROJECT_DIR"
+    npm install
+    log_success "Dependencies installed."
+}
+
+vite_build(){
+    log_info "Building project with Vite..."
+    if [[ ! -d "$NODE_MODULES" ]]; then
+        log_warn "node_modules missing, installing..."
+        npm install
+    fi
+    npm install -g vite
+    vite build
+    log_success "Build complete."
+}
+
+link_bin(){
+    if [[ -d "$PROJECT_DIR/bin" ]]; then
+        export PATH="$PATH:$PROJECT_DIR/bin"
+        log_success "Project bin linked to PATH."
+    else
+        log_warn "No bin directory found to link."
+    fi
+}
+
+# ---------------- MAIN ----------------
+main(){
+    init_git
+    update_repo
+    install_deps
+    vite_build
+    link_bin
+    log_info "Git rebuild and project build finished."
+}
+
+main "$@"

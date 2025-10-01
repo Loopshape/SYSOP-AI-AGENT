@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+
+# mega_ai_cli.sh - Bulletproof Unified AI & DevOps CLI v360+ (reloop, streaming + capture)
+# Recursive parser, code fixer, file hasher, DevOps assistant
+# Mandatory token streaming — now with iterative apply/re-analyze loop
+
+set -euo pipefail
+IFS=$'\n\t'
+trap 'echo -e "\033[31m[ERROR] Script interrupted or failed at line $LINENO\033[0m"' ERR INT
+
+# --- CONFIG ---
+AI_HOME="${AI_HOME:-$HOME/.ai_agent}"
+PROJECTS_DIR="${PROJECTS_DIR:-$HOME/.local_ai}"
+MEMORY_DB="$AI_HOME/memory.db"
+CONFIG_DB="$AI_HOME/config.db"
+DB_HASH="$AI_HOME/cli.sqlite"
+SNAPSHOT_DIR="$AI_HOME/snapshots"
+OLLAMA_BIN="$(command -v ollama || true)"
+MAX_ITERATIONS="${MAX_ITERATIONS:-15}"
+
+DEFAULT_AGENT_MODEL="code"
+DEFAULT_CODEWRITER_MODEL="2244"
+DEFAULT_VALIDATOR_MODEL="core"
+
+AGENT_MODEL="${AGENT_MODEL:-core}"
+CODEWRITER_MODEL="${CODEWRITER_MODEL:-2244}"
+VALIDATOR_MODEL="${VALIDATOR_MODEL:-loop}"
+
+AUTO_APPROVE="${AUTO_APPROVE:-0}"   # set to 1 to auto-approve all changes (can be overridden via --auto/-y)
+
+mkdir -p "$AI_HOME" "$PROJECTS_DIR" "$SNAPSHOT_DIR"
+
+# --- COLORS & LOGGING ---
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'; NC='\033[0m'
+log() { printf "${BLUE}[%s]${NC} %s\n" "$(date '+%T')" "$*"; }
+log_success() { log "${GREEN}$*${NC}"; }
+log_warn() { log "${YELLOW}WARN: $*${NC}"; }
+log_error() { log "${RED}ERROR: $*${NC}"; exit 1; }
+log_info() { log "${CYAN}$*${NC}"; }
+log_phase() { echo -e "\n${PURPLE}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}"; log "${PURPLE}$*${NC}"; }
+
+# --- UTILITIES ---
+sqlite_escape() { echo "$1" | sed "s/'/''/g"; }
+confirm_action() {
+    local msg="$1"
+    if [[ "${AUTO_APPROVE}" -eq 1 ]]; then
+        log_success "Auto-approved: $msg"
+        return 0
+    fi
+    echo -e "\n${YELLOW}PROPOSED ACTION:${NC} ${CYAN}$msg${NC}"
+    read -p "Approve? [y/N] " -n 1 -r c; echo
+    [[ "$c" =~ ^[Yy]$ ]]
+}
+gen_task_id() { echo -n "$1$(date +%s%N)$RANDOM" | sha256sum | cut -c1-16; }
+ensure_ollama_server() { if ! pgrep -f "ollama serve" >/dev/null; then log "Ollama starting..."; nohup "$OLLAMA_BIN" serve >/dev/null 2>&1 & sleep 3; fi; }
+
+# Run model and stream tokens to tty while capturing the full output and returning it.
+run_model_streaming() {
+    local model="$1" prompt="$2"
+    ensure_ollama_server
+    if [[ -z "$OLLAMA_BIN" ]]; then log_error "Ollama CLI not found"; fi
+    log_info "Streaming tokens from model $model..."
+    local tmp
+    tmp=$(mktemp) || { log_error "Failed to create tmpfile"; }
+    # Ensure tmp is removed after the function returns
+    trap 'rm -f "$tmp"' RETURN
+
+    # stream to tty and capture into tmp
+    # NOTE: stdbuf ensures unbuffered streaming where available
+    stdbuf -o0 "$OLLAMA_BIN" run "$model" "$prompt" | tee /dev/tty >"$tmp" || true
+
+    # return captured content
+    cat "$tmp"
+}
+
+# --- CONFIG & MEMORY ---
+init_db() {
+    sqlite3 "$MEMORY_DB" "CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY, timestamp DATETIME, mode TEXT, prompt TEXT, result TEXT, status TEXT, task_id TEXT);" 2>/dev/null || true
+    sqlite3 "$CONFIG_DB" "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);" 2>/dev/null || true
+    sqlite3 "$DB_HASH" "CREATE TABLE IF NOT EXISTS file_hashes(id INTEGER PRIMARY KEY, path TEXT UNIQUE, hash TEXT, status TEXT, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP);" 2>/dev/null || true
+    sqlite3 "$DB_HASH" "CREATE TABLE IF NOT EXISTS file_hash_events(id INTEGER PRIMARY KEY, path TEXT, old_hash TEXT, new_hash TEXT, event_type TEXT, ts DATETIME DEFAULT CURRENT_TIMESTAMP);" 2>/dev/null || true
+}
+
+set_config() { sqlite3 "$CONFIG_DB" "INSERT OR REPLACE INTO config (key,value) VALUES ('$(sqlite_escape "$1")','$(sqlite_escape "$2")');" && log_success "Config set: $1=$2"; }
+get_config() { sqlite3 "$CONFIG_DB" "SELECT value FROM config WHERE key='$(sqlite_escape "$1")';" 2>/dev/null; }
+load_config_values() {
+    AGENT_MODEL=$(get_config agent_model || echo "$DEFAULT_AGENT_MODEL")
+    CODEWRITER_MODEL=$(get_config codewriter_model || echo "$DEFAULT_CODEWRITER_MODEL")
+    VALIDATOR_MODEL=$(get_config validator_model || echo "$DEFAULT_VALIDATOR_MODEL")
+}
+add_memory() { sqlite3 "$MEMORY_DB" "INSERT INTO memories (mode,prompt,result,status,task_id) VALUES ('$1','$(sqlite_escape "$2")','$(sqlite_escape "$3")','$4','$5');" 2>/dev/null; }
+search_memory() { sqlite3 -header -column "$MEMORY_DB" "SELECT timestamp,mode,prompt,status FROM memories WHERE prompt LIKE '%$(sqlite_escape "$1")%' ORDER BY timestamp DESC LIMIT 5;" 2>/dev/null; }
+
+# --- FILE HASHING ---
+run_sql() { local sql="$1"; sqlite3 "$DB_HASH" "$sql"; }
+sha256_file() { sha256sum "$1" | awk '{print $1}'; }
+hash_file() {
+    local f="$1" h old event_type
+    [[ -f "$f" ]] || return
+    h=$(sha256_file "$f")
+    old=$(sqlite3 "$DB_HASH" "SELECT hash FROM file_hashes WHERE path='$(sqlite_escape "$f")';")
+    event_type="hash"
+    [[ -n "$old" && "$old" != "$h" ]] && event_type="rehash"
+    run_sql "INSERT INTO file_hashes(path,hash,status,updated_at) VALUES('$(sqlite_escape "$f")','$h','${event_type}d',CURRENT_TIMESTAMP) ON CONFLICT(path) DO UPDATE SET hash=excluded.hash,status=excluded.status,updated_at=excluded.updated_at;"
+    run_sql "INSERT INTO file_hash_events(path,old_hash,new_hash,event_type) VALUES('$(sqlite_escape "$f")','$old','$h','$event_type');"
+    log_info "$event_type: $f -> $h"
+}
+hash_files_verbose() { while IFS= read -r f; do hash_file "$f"; done < <(find "${1:-.}" -type f); }
+
+# --- FILE PARSING ---
+resolve_ref_to_abs() { local base="$1" ref="$2"; [[ -z "$ref" ]] && echo ""; [[ "$ref" == /* ]] && echo "$ref"; echo "$base/$ref"; }
+
+# improved, safer extractor for common attribute patterns (href/src/import/include/require)
+extract_refs_from_file() {
+    local f="$1"
+    # looks for patterns like src="...", href='...', import "x", include="x"
+    grep -Eo '(src|href|include|require|import)[[:space:]]*[:=]?[[:space:]]*["'"'"'][^"'"'"']+["'"'"']' "$f" 2>/dev/null \
+      | sed -E "s/.*['\"]([^'\"]+)['\"].*/\1/" || true
+}
+
+follow_refs() {
+    local start="$1" visited="$(mktemp)" ref absref
+    trap 'rm -f "$visited"' EXIT
+    # Start with all files (so we always analyze everything present), then follow references
+    find "$start" -type f -print0 | while IFS= read -r -d '' f; do echo "$f" >> "$visited"; done
+    local idx=1
+    while true; do
+        local total=$(wc -l < "$visited")
+        [[ $idx -gt $total ]] && break
+        local current
+        current=$(sed -n "${idx}p" "$visited")
+        idx=$((idx+1))
+        while IFS= read -r ref; do
+            absref=$(resolve_ref_to_abs "$(dirname "$current")" "$ref")
+            [[ -f "$absref" ]] || continue
+            grep -qxF "$absref" "$visited" || echo "$absref" >> "$visited"
+        done < <(extract_refs_from_file "$current")
+    done
+    cat "$visited"
+}
+
+# --- TOOLS ---
+tool_read_file() { [[ -f "$2" ]] && cat "$2" || echo "Error: File not found"; }
+tool_write_file() { if confirm_action "Write to $2?"; then echo -e "$3" > "$2"; fi; }
+tool_list_directory() { tree -L 2 "${2:-.}"; }
+tool_run_command() { confirm_action "Run: $2" && eval "$2"; }
+tool_web_search() { curl -sL "https://html.duckduckgo.com/html/?q=$(jq -nr --arg q "$2" '$q|@uri')" | lynx -dump -stdin -nolist; }
+
+# --- AGENT: iterative analyze -> fix -> apply -> re-analyze loop ---
+run_unified_agent() {
+    local user_prompt="$*"
+    local task_id
+    task_id=$(gen_task_id "$user_prompt")
+    local project_dir="$PROJECTS_DIR/$task_id"
+    mkdir -p "$project_dir"
+    cd "$project_dir" || log_error "Cannot cd to $project_dir"
+    log_success "Workspace: $project_dir"
+
+    load_config_values
+    log_info "Hashing and analyzing files..."
+    local files
+    files=$(follow_refs ".")
+    hash_files_verbose "."
+
+    local iter=0
+    local overall_changes=0
+
+    while [[ $iter -lt $MAX_ITERATIONS ]]; do
+        iter=$((iter+1))
+        log_phase "Iteration $iter / $MAX_ITERATIONS"
+        local changed=0
+
+        # refresh file list in case fixes added new files
+        files=$(follow_refs ".")
+        while IFS= read -r f; do
+            [[ -f "$f" ]] || continue
+            log_info "Analyzing file: $f"
+            local code
+            code=$(cat "$f")
+
+            # prepare prompt: instruct model to output a [FIX]...[/FIX] block when proposing replacement
+            local ai_prompt
+            ai_prompt="You are an expert code fixer. Analyze the file at path: $f. Provide:
+1) A clear list of issues and the steps you'd take to fix them.
+2) If you propose a replacement of the file content, include ONLY the replacement between tags on their own lines:
+[FIX]
+<full replacement file content here>
+[/FIX]
+Do not include any other extraneous markers around the tags. File content begins below:
+<<<FILE_START>>>
+$code
+<<<FILE_END>>>
+Be conservative: if you only recommend small changes, return just the minimal fixed file inside [FIX]...[/FIX]."
+
+            # run model (streaming + capture)
+            local ai_response
+            ai_response=$(run_model_streaming "$AGENT_MODEL" "$ai_prompt")
+
+            # extract the first [FIX]...[/FIX] block (if any)
+            local fixed_code
+            fixed_code=$(echo "$ai_response" | awk '/^\[FIX\]/{f=1;next}/^\[\/FIX\]/{f=0} f' || true)
+            # trim trailing newlines
+            fixed_code=$(printf "%s" "$fixed_code" | sed -e :a -e '/^\n*$/{$d;N;ba' -e '}' || true)
+
+            # If a fixed block was provided and differs, propose applying
+            if [[ -n "$fixed_code" ]]; then
+                if ! printf "%s" "$fixed_code" | diff -u --label "orig" --label "fixed" - "$f" >/dev/null 2>&1; then
+                    log_warn "Proposed fix for $f detected"
+                    if confirm_action "Apply proposed fix to $f?"; then
+                        # create backup
+                        cp -a "$f" "${f}.bak.$$" || true
+                        printf "%s\n" "$fixed_code" > "$f"
+                        hash_file "$f"
+                        changed=1
+                        overall_changes=1
+                        log_success "Applied fix to $f (backup: ${f}.bak.$$)"
+                    else
+                        log_info "Skipped applying fix to $f"
+                    fi
+                else
+                    log_info "Model suggested change for $f but content is identical — skipping apply."
+                fi
+            else
+                log_info "No [FIX] block produced for $f"
+            fi
+        done <<< "$files"
+
+        # if nothing changed in this pass, done
+        if [[ $changed -eq 0 ]]; then
+            log_success "No changes in iteration $iter — converged."
+            break
+        fi
+
+        # else continue to next iteration to re-analyze after applied changes
+        log_info "Changes applied in iteration $iter — re-analyzing..."
+    done
+
+    # summarize overall
+    local final_answer
+    final_answer=$(run_model_streaming "$AGENT_MODEL" "Summarize all analyses and applied fixes for the project workspace. List remaining concerns (if any).")
+
+    add_memory "agent" "$user_prompt" "$final_answer" "SUCCESS" "$task_id"
+    log_success "Agent task complete — iterations: $iter, changes applied: $overall_changes"
+    echo -e "\033[32mFINAL OUTPUT:\033[0m\n$final_answer"
+}
+
+# --- HELP ---
+show_help() { echo -e "${GREEN}Mega AI CLI v360+SQL (with reloop)\nUsage: mega_ai_cli.sh [--auto|-y] [prompt]\nFlags:\n  --auto, -y     Auto-approve and apply all fixes without interactive prompts\n${NC}"; }
+
+main() {
+    init_db; load_config_values
+
+    # simple flag parse for --auto/-y
+    if [[ $# -ge 1 ]]; then
+        if [[ "$1" == "--auto" || "$1" == "-y" ]]; then
+            AUTO_APPROVE=1
+            shift
+        fi
+    fi
+
+    [[ $# -eq 0 ]] && { show_help; exit 0; }
+    run_unified_agent "$@"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then main "$@"; fi

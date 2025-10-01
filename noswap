@@ -1,0 +1,18 @@
+#!/data/data/com.termux/files/usr/bin/bash
+echo "[*] Checking active swap..."
+swapon --show
+
+echo "[*] Turning off all swap..."
+swapoff -a
+
+echo "[*] Removing common swapfiles..."
+rm -f ~/swapfile \
+      /data/data/com.termux/files/home/swapfile \
+      /data/data/com.termux/files/usr/tmp/swapfile
+
+echo "[*] Cleaning startup configs..."
+sed -i '/swapon/d' ~/.bashrc ~/.profile ~/.zshrc 2>/dev/null
+
+echo "[*] Final check:"
+free -h
+

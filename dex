@@ -1,0 +1,249 @@
+#!/usr/bin/env bash
+# ~/bin/ai - Fully self-contained AI Platform
+# Features: Relative paths, AGI loops, Ollama streaming, caching, trading, file tracking
+set -euo pipefail
+IFS=$'\n\t'
+
+# === RELATIVE PATHS & CONFIG ===
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+AI_HOME="${AI_HOME:-$SCRIPT_DIR/.ai_agent}"
+PROJECTS_DIR="${PROJECTS_DIR:-$AI_HOME/ai_projects}"
+LOG_DIR="$AI_HOME/logs"
+TMP_DIR="$AI_HOME/tmp"
+SWAP_DIR="$AI_HOME/swap"
+CORE_DB="$AI_HOME/agent_core.db"
+TASK_DB="$AI_HOME/ai_task_manager.db"
+HMAC_SECRET_KEY="$AI_HOME/secret.key"
+
+MAX_AGENT_LOOPS=7
+MAX_RAM_BYTES=2097152
+
+OLLAMA_BIN="$(command -v ollama || echo 'ollama')"
+
+# Ensure mandatory execution
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    echo "ERROR: AI Platform must be run via ~/bin/ai"
+    exit 1
+fi
+
+mkdir -p "$AI_HOME" "$PROJECTS_DIR" "$LOG_DIR" "$TMP_DIR" "$SWAP_DIR"
+
+# === COLORS & ICONS ===
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+ICON_SUCCESS="✅"; ICON_WARN="⚠️"; ICON_ERROR="❌"; ICON_INFO="ℹ️"; ICON_TASK="📝"; ICON_TRADE="💰"; ICON_AI="🤖"
+
+log_msg(){ echo -e "$(date '+%H:%M:%S') $1 $2$NC"; }
+log_info(){ log_msg "$BLUE[INFO]" "$1"; }
+log_warn(){ log_msg "$YELLOW[WARN]" "$1"; }
+log_error(){ log_msg "$RED[ERROR]" "$1"; }
+log_success(){ log_msg "$GREEN[SUCCESS]" "$1"; }
+
+# === DB FUNCTIONS ===
+sql_escape(){ echo "$1" | sed "s/'/''/g"; }
+run_sql(){ sqlite3 "$TASK_DB" "$1"; }
+sha256_file(){ sha256sum "$1" | awk '{print $1}'; }
+
+init_db(){
+    if [[ ! -f "$TASK_DB" ]]; then
+        run_sql "CREATE TABLE projects(hash TEXT PRIMARY KEY,path TEXT NOT NULL,ts DATETIME DEFAULT CURRENT_TIMESTAMP);
+                 CREATE TABLE file_hashes(project_hash TEXT,file_path TEXT,file_hash TEXT,rehashed INTEGER DEFAULT 0,PRIMARY KEY(project_hash,file_path));
+                 CREATE TABLE events(id INTEGER PRIMARY KEY AUTOINCREMENT,ts DATETIME DEFAULT CURRENT_TIMESTAMP,type TEXT,data TEXT);"
+        log_success "Task DB initialized at $TASK_DB"
+    fi
+    if [[ ! -f "$CORE_DB" ]]; then
+        sqlite3 "$CORE_DB" "CREATE TABLE memories(id INTEGER PRIMARY KEY,prompt_hash TEXT,prompt TEXT,response_ref TEXT);"
+    fi
+    if [[ ! -f "$HMAC_SECRET_KEY" ]]; then
+        openssl rand -hex 32 > "$HMAC_SECRET_KEY"
+        chmod 600 "$HMAC_SECRET_KEY"
+        log_success "Generated HMAC secret key"
+    fi
+}
+
+# === TASK FUNCTIONS ===
+ingest_repo(){
+    local repo="$1"
+    [[ -d "$repo" ]] || { log_error "Repo not found: $repo"; return 1; }
+    local hash=$(echo -n "$repo" | sha256sum | awk '{print $1}')
+    run_sql "INSERT OR IGNORE INTO projects(hash,path) VALUES('$(sql_escape "$hash")','$(sql_escape "$repo")');"
+    find "$repo" -type f | while read -r f; do
+        local fh=$(sha256_file "$f")
+        run_sql "INSERT OR REPLACE INTO file_hashes(project_hash,file_path,file_hash,rehashed) VALUES('$(sql_escape "$hash")','$(sql_escape "$f")','$fh',0);"
+    done
+    log_success "Repo ingested: $repo -> $hash"
+}
+
+rehash_repo_files(){
+    local repo_hash="$1"; shift
+    local mode="${1:-set}"
+    local base=$(sqlite3 "$TASK_DB" "SELECT path FROM projects WHERE hash='$(sql_escape "$repo_hash")' LIMIT 1;")
+    [[ -z "$base" ]] && { log_error "No project path for $repo_hash"; return 1; }
+    log_info "Rehashing $base [mode=$mode]"
+    find "$base" -type f | while read -r f; do
+        local newh=$(sha256_file "$f")
+        local oldh=$(sqlite3 "$TASK_DB" "SELECT file_hash FROM file_hashes WHERE project_hash='$(sql_escape "$repo_hash")' AND file_path='$(sql_escape "$f")';")
+        if [[ "$newh" != "$oldh" ]]; then
+            [[ "$mode" == "set" ]] && run_sql "INSERT OR REPLACE INTO file_hashes(project_hash,file_path,file_hash,rehashed) VALUES('$(sql_escape "$repo_hash")','$(sql_escape "$f")','$newh',1);"
+            log_info "Updated hash: $f"
+        fi
+    done
+    log_success "Rehash complete for $repo_hash"
+}
+
+# === AI & OLAMA FUNCTIONS ===
+ensure_ollama(){
+    if ! curl -s http://localhost:11434/api/tags >/dev/null; then
+        log_info "Starting Ollama service..."
+        nohup "$OLLAMA_BIN" serve >/dev/null 2>&1 &
+        sleep 3
+        curl -s http://localhost:11434/api/tags >/dev/null || log_error "Ollama failed to start"
+    fi
+}
+
+run_worker_streaming(){
+    local model="$1" system="$2" prompt="$3"
+    local payload r full=""
+    payload=$(jq -nc --arg m "$model" --arg s "$system" --arg p "$prompt" '{model:$m,system:$s,prompt:$p,stream:true}')
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        if jq -e . >/dev/null 2>&1 <<<"$line"; then
+            local token=$(echo "$line"|jq -r '.response // empty')
+            [[ -n "$token" ]] && { printf "%s" "$token"; full+="$token"; }
+        fi
+    done < <(curl -s --max-time 300 -X POST http://localhost:11434/api/generate -d "$payload")
+    printf "\n"
+    echo "$full"
+}
+
+hash_string(){ echo -n "$1" | sha256sum | cut -d' ' -f1; }
+semantic_hash_prompt(){ echo "$1" | tr '[:upper:]' '[:lower:]' | tr -cs 'a-z0-9' ' ' | tr -s ' ' | sed 's/^ *//;s/ *$//' | tr ' ' '_'; }
+store_output_fast(){ local c="$1" h=$(hash_string "$c"); if ((${#c}>MAX_RAM_BYTES)); then f="$SWAP_DIR/$h.txt.gz"; echo "$c"|gzip>"$f"; echo "$f"; else echo "$c"; fi; }
+retrieve_output_fast(){ local r="$1"; [[ -f "$r" ]] && { [[ "$r" == *.gz ]] && gzip -dc "$r"||cat "$r"; } || echo "$r"; }
+get_cached_response(){ local p_h=$(semantic_hash_prompt "$1"); sqlite3 "$CORE_DB" "SELECT response_ref FROM memories WHERE prompt_hash = '$(sql_escape "$p_h")' LIMIT 1;"; }
+add_to_memory_fast(){ local p_h="$1" p="$2" ref="$3"; sqlite3 "$CORE_DB" "INSERT INTO memories (prompt_hash,prompt,response_ref) VALUES ('$(sql_escape "$p_h")','$(sql_escape "$p")','$(sqlite_escape "$ref")');"; }
+
+# === TOOL FUNCTIONS ===
+tool_ask_human(){
+    local q="$*"
+    echo -e "${YELLOW}🤔 AI requests input:${NC} $q"
+    read -p "Your Response: " -r res
+    echo "Human feedback: '$res'"
+}
+
+tool_trade(){
+    local asset="${1:-BTC/USD}"
+    log_info "Trading analysis for $asset..."
+    echo -e "📊 Market Analysis for $asset: [RSI, MACD, Support/Resistance, Volume simulated]"
+}
+
+# === AGI WORKFLOW ===
+run_agi_workflow(){
+    local prompt="$*"
+    ensure_ollama
+    local task_id=$(hash_string "$prompt$(date +%s%N)" | cut -c1-16)
+    local project_dir="$PROJECTS_DIR/task-$task_id"
+    mkdir -p "$project_dir"
+    log_success "Workspace: $project_dir (Task $task_id)"
+
+    # Wildcard handling
+    [[ "$prompt" == "*" ]] && prompt="Analyze all files in $(pwd)"
+
+    # Cached response
+    local cached_ref=$(get_cached_response "$prompt")
+    [[ -n "$cached_ref" ]] && { log_success "Found cached response"; retrieve_output_fast "$cached_ref"; return; }
+
+    local conv="User Prompt: $prompt"
+    local final_answer=""
+    for ((i=1;i<=MAX_AGENT_LOOPS;i++)); do
+        log_info "AGI Loop $i/$MAX_AGENT_LOOPS"
+        local messenger=$(run_worker_streaming "llama3:latest" "Analyze state" "$conv")
+        local executor_context="You are the Executor. Decide tool or final answer. Context: $messenger"
+        local plan=$(run_worker_streaming "llama3:8b" "Executor" "$executor_context")
+        if [[ "$plan" == *"[FINAL_ANSWER]"* ]]; then
+            final_answer=$(echo "$plan" | sed 's/FINAL_ANSWER//')
+            break
+        fi
+        # tool execution placeholder
+        conv="Loop $i: $plan"
+    done
+
+    [[ -z "$final_answer" ]] && final_answer="Workflow completed: $conv"
+    local ref=$(store_output_fast "$final_answer")
+    add_to_memory_fast "$(semantic_hash_prompt "$prompt")" "$prompt" "$ref"
+    echo -e "\n${GREEN}--- Final Result ---${NC}\n$final_answer"
+}
+
+# === MAIN DISPATCHER ===
+show_help(){
+    cat << EOF
+Usage: ai <command> [options]
+
+AI Core:
+  <prompt>           Run AGI workflow with prompt
+
+Task Management:
+  ingest <path>      Ingest project files for tracking
+  rehash <hash>      Rehash project files (options: set|del)
+
+Trading:
+  trade [asset]      Perform market analysis/trade (default BTC/USD)
+
+System:
+  status             Show AI system status
+  heal               Self-repair cleanup
+  help               Show this help message
+
+Flags:
+  --auto             Automatic mode for workflows
+
+Examples:
+  ai "generate a report on project"
+  ai ingest ./my_project
+  ai rehash abc123 --set
+  ai trade ETH/USD
+EOF
+}
+
+main(){
+    init_db
+    local cmd="${1:-}"
+    shift || true
+
+    case "$cmd" in
+        -h|--help|help)
+            show_help
+            ;;
+        ingest)
+            ingest_repo "$@"
+            ;;
+        rehash)
+            local hash="$1"; shift
+            rehash_repo_files "$hash" "${1:-set}"
+            ;;
+        trade)
+            tool_trade "$@"
+            ;;
+        status)
+            echo "AI_HOME: $AI_HOME"
+            echo "Projects: $PROJECTS_DIR"
+            echo "Task DB: $TASK_DB"
+            echo "Core DB: $CORE_DB"
+            curl -s http://localhost:11434/api/tags >/dev/null && echo "Ollama: ✅ Running" || echo "Ollama: ❌ Stopped"
+            ;;
+        heal)
+            rm -rf "$TMP_DIR"/* "$SWAP_DIR"/* 2>/dev/null || true
+            log_success "Self-heal completed"
+            ;;
+        "")
+            show_help
+            ;;
+        *)
+            run_agi_workflow "$cmd $*"
+            ;;
+    esac
+}
+
+# --- SCRIPT ENTRY POINT ---
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

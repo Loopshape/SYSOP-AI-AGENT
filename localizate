@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------------- CONFIG ----------------
+PROJECT_DIR="${PROJECT_DIR:-$HOME/.local_ai}"
+REMOTE_REPO="git@github.com:Loopshape/SYSOP-AI-AGENT.git"
+NODE_MODULES="$PROJECT_DIR/node_modules"
+BUILD_DIR="$PROJECT_DIR/dist"
+AI_CMD="$PROJECT_DIR/bin/ai"
+LOG_FILE="$PROJECT_DIR/ai.log"
+MAX_RAM_MB=512  # Termux low-RAM precaution
+
+# ---------------- LOGGING ----------------
+log() {
+    local lvl="$1"
+    local msg="$2"
+    printf "[%s] %s %s\n" "$lvl" "$(date '+%H:%M:%S')" "$msg" | tee -a "$LOG_FILE"
+}
+log_info()    { log "INFO"    "$1"; }
+log_warn()    { log "WARN"    "$1"; }
+log_error()   { log "ERROR"   "$1"; exit 1; }
+log_success() { log "SUCCESS" "$1"; }
+
+# ---------------- FUNCTIONS ----------------
+mkdir_if_missing() {
+    if [[ ! -d "$PROJECT_DIR" ]]; then
+        mkdir -p "$PROJECT_DIR" || log_error "Failed to create project directory: $PROJECT_DIR"
+        log_info "Created project directory: $PROJECT_DIR"
+    fi
+}
+
+init_git() {
+    if [[ ! -d "$PROJECT_DIR/.git" ]]; then
+        log_info "Initializing git repo..."
+        git init "$PROJECT_DIR"
+        git -C "$PROJECT_DIR" remote add origin "$REMOTE_REPO"
+    else
+        log_info "Git repo already exists."
+    fi
+}
+
+update_repo() {
+    log_info "Fetching latest changes from remote..."
+    git -C "$PROJECT_DIR" fetch --all
+
+    # Detect default branch
+    DEFAULT_BRANCH=$(git -C "$PROJECT_DIR" remote show origin | awk '/HEAD branch/ {print $NF}')
+    git -C "$PROJECT_DIR" reset --hard "origin/$DEFAULT_BRANCH"
+    log_success "Repository is up-to-date (branch: $DEFAULT_BRANCH)."
+}
+
+install_deps() {
+    log_info "Installing npm dependencies..."
+    cd "$PROJECT_DIR"
+    npm install
+    log_success "Dependencies installed."
+}
+
+vite_build() {
+    log_info "Building project with Vite..."
+    # Only install Vite globally if not already present
+    if ! command -v vite &>/dev/null; then
+        npm install -g vite
+    fi
+    vite build
+    log_success "Vite build complete."
+}
+
+link_bin() {
+    if [[ -d "$PROJECT_DIR/bin" ]]; then
+        case ":$PATH:" in
+            *":$PROJECT_DIR/bin:"*) ;;
+            *) export PATH="$PATH:$PROJECT_DIR/bin"; log_success "Project bin linked to PATH."; ;;
+        esac
+    else
+        log_warn "No bin directory found to link."
+    fi
+}
+
+check_ram() {
+    local available_ram_mb
+    if command -v free &>/dev/null; then
+        available_ram_mb=$(free -m | awk '/Mem:/ {print $7}')
+    elif [[ "$(uname)" == "Darwin" ]]; then
+        available_ram_mb=$(vm_stat | awk '/free/ {sum+=$3} END {printf "%d\n", sum*4096/1024/1024}')
+    else
+        available_ram_mb=$MAX_RAM_MB  # Fallback
+    fi
+
+    if (( available_ram_mb < MAX_RAM_MB )); then
+        log_warn "Low available RAM ($available_ram_mb MB). Build might fail!"
+    fi
+}
+
+run_ai_workflow() {
+    if [[ -x "$AI_CMD" ]]; then
+        log_info "Starting AI workflow..."
+        # Use arguments passed to script or default
+        "$AI_CMD" "${@:-rebuild and validate all modules}" 2>&1 | tee -a "$LOG_FILE"
+        log_success "AI workflow complete."
+    else
+        log_error "AI binary not found or not executable: $AI_CMD"
+    fi
+}
+
+rotate_log() {
+    if [[ -f "$LOG_FILE" ]]; then
+        mv "$LOG_FILE" "$LOG_FILE.old" 2>/dev/null || log_warn "Failed to rotate log file."
+    fi
+}
+
+# ---------------- MAIN ----------------
+main() {
+    log_info "==== Starting Git Build & AGI Workflow ===="
+    mkdir_if_missing
+    rotate_log
+    check_ram
+    init_git
+    update_repo
+    install_deps
+    vite_build
+    link_bin
+    run_ai_workflow "$@"
+    log_info "==== Build & Workflow Finished ===="
+}
+
+main "$@"

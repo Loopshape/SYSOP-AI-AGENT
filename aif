@@ -1,0 +1,183 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------------- CONFIG ----------------
+PROJECT_DIR="${HOME}/.local_ai"
+HASH_DB="$PROJECT_DIR/hash_registry.db"
+HOST="${HOST:-127.0.0.1}"
+PORT="${PORT:-8888}"
+REHASH_INTERVAL=600  # 10 minutes
+
+# ---------------- LOGGING ----------------
+log() { local lvl="$1"; local msg="$2"; printf "[%s] %s %s\n" "$lvl" "$(date '+%H:%M:%S')" "$msg"; }
+log_info() { log "INFO" "$1"; }
+log_warn() { log "WARN" "$1"; }
+log_error() { log "ERROR" "$1"; exit 1; }
+log_success() { log "SUCCESS" "$1"; }
+
+# ---------------- ENV LOADING ----------------
+if [[ -f "$PROJECT_DIR/.env" ]]; then
+    log_info "Loading environment variables from .env"
+    set -o allexport
+    source "$PROJECT_DIR/.env"
+    set +o allexport
+fi
+
+# ---------------- HASH INDEX ----------------
+rehash_old_entries() {
+    local now
+    now=$(date +%s)
+    local old_entries
+    old_entries=$(sqlite3 "$HASH_DB" "SELECT hash, original_hash, timestamp, rehash_count FROM hash_registry WHERE $now - timestamp > $REHASH_INTERVAL;")
+    if [[ -n "$old_entries" ]]; then
+        while IFS='|' read -r hash original ts rehash_count; do
+            local new_hash
+            new_hash=$(echo -n "${original}${now}" | sha256sum | cut -d' ' -f1)
+            local new_count=$((rehash_count + 1))
+            sqlite3 "$HASH_DB" "UPDATE hash_registry SET hash='$new_hash', timestamp=$now, rehash_count=$new_count, last_accessed=$now WHERE hash='$hash';"
+            log_info "Rehashed: $hash → $new_hash (count: $new_count)"
+        done <<< "$old_entries"
+    fi
+}
+
+store_hash() {
+    local content="$*"
+    local h ts
+    h=$(echo -n "$content" | sha256sum | cut -d' ' -f1)
+    ts=$(date +%s)
+    sqlite3 "$HASH_DB" "INSERT OR REPLACE INTO hash_registry (hash, original_hash, timestamp, last_accessed) VALUES ('$h','$h',$ts,$ts);"
+    log_info "Stored hash: $h"
+}
+
+# ---------------- SELF-HEAL ----------------
+self_heal() {
+    log_info "Starting self-heal scan..."
+    local files repaired_count=0
+    files=$(find "$PROJECT_DIR" -type f \( -name "*.tsx" -o -name "*.ts" -o -name "*.json" -o -name "*.js" \))
+    for f in $files; do
+        if grep -qE '^(<<<<<<<|=======|>>>>>>>)' "$f"; then
+            log_warn "Merge conflict detected in $f. Repairing..."
+            sed -i.bak -E '/^<<<<<<<|^=======|^>>>>>>>/d' "$f"
+            repaired_count=$((repaired_count+1))
+        fi
+    done
+    log_success "Self-heal complete. Files repaired: $repaired_count"
+}
+
+# ---------------- BUILD ERROR AUTO-PATCH ----------------
+auto_patch_build_errors() {
+    log_info "Scanning for build errors..."
+    local tsx_files patched_count=0
+    tsx_files=$(find "$PROJECT_DIR" -type f -name "*.tsx")
+    for f in $tsx_files; do
+        local changed=false
+        # Fix duplicate 'const ai' declarations
+        if grep -qE 'const ai\s*=' "$f"; then
+            local first_line
+            first_line=$(grep -n 'const ai\s*=' "$f" | head -n1 | cut -d: -f1)
+            awk -v first="$first_line" '/const ai\s*=/ {if(NR!=first){print "// auto-commented: "$0; next}} {print}' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+            changed=true
+        fi
+        # Wrap top-level await inside async IIFE
+        if grep -q 'await ' "$f"; then
+            if ! grep -q 'async function' "$f"; then
+                sed -i.bak -e '1 i(async()=>{' -e '$ a })();' "$f"
+                changed=true
+            fi
+        fi
+        $changed && patched_count=$((patched_count+1)) && log_warn "Patched build issues in $f"
+    done
+    log_success "Build auto-patch complete. Files patched: $patched_count"
+}
+
+# ---------------- DEV SERVER ----------------
+run_server() {
+    log_info "Starting AI dev server at http://$HOST:$PORT with Vite watch, auto-rehash, self-heal & patch..."
+    cd "$PROJECT_DIR"
+
+    # Periodic loop
+    (
+        while true; do
+            rehash_old_entries
+            self_heal
+            auto_patch_build_errors
+            sleep $REHASH_INTERVAL
+        done
+    ) &
+
+    # Start Vite watch
+    npx vite build --watch &
+    VITE_PID=$!
+
+    # Express server
+    node <<'NODE'
+import express from 'express';
+import path from 'path';
+import { fileURLToPath } from 'url';
+const app = express();
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+app.use(express.json());
+app.use(express.static(path.join(__dirname, "dist")));
+app.post("/ai-prompt", (req, res) => {
+    const { prompt, response } = req.body;
+    console.log(`[AI] Received prompt: ${prompt}`);
+    res.json({ status: "ok" });
+});
+app.get("*", (req, res) => res.sendFile(path.join(__dirname, "dist", "index.html")));
+const host = process.env.HOST || "127.0.0.1";
+const port = parseInt(process.env.PORT || "8888", 10);
+app.listen(port, host, () => console.log(`[SUCCESS] Dev server running at http://${host}:${port}`));
+NODE
+
+    kill $VITE_PID
+}
+
+# ---------------- CLI ----------------
+main() {
+    local cmd="${1:-}"
+
+    case "$cmd" in
+        --help)
+            cat <<EOF
+Usage: ai.sh [OPTIONS]
+
+Options:
+  --serve         Start dev server
+  --watch         Start dev server in watch mode
+  --fix, --heal   Run self-heal (merge conflicts)
+  --patch-build   Auto-patch build errors
+  --hash          Store hash of content
+  --rehash-all    Rehash old memory entries
+  --prompt <txt>  Hash a prompt
+  --help          Show this help
+EOF
+            ;;
+        --serve|--watch)
+            run_server
+            ;;
+        --fix|--heal)
+            self_heal
+            ;;
+        --patch-build)
+            auto_patch_build_errors
+            ;;
+        --hash)
+            shift
+            store_hash "$*"
+            ;;
+        --rehash-all)
+            rehash_old_entries
+            ;;
+        --prompt)
+            shift
+            echo "Processing prompt: $*"
+            store_hash "$*"
+            ;;
+        *)
+            echo "No command given. Use --help for options."
+            ;;
+    esac
+}
+
+main "$@"

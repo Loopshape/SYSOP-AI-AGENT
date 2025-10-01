@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+# AI Hybrid Agent v22 – Turbo, Weighted Fuzzy Cache, Smart Swap, Fast SQLite
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# ---------------- CONFIG ----------------
+SCRIPT_NAME="ai"
+SCRIPT_VERSION="22.0"
+AI_HOME="${AI_HOME:-$HOME/.ai_agent}"
+PROJECTS_DIR="${PROJECTS_DIR:-$HOME/ai_projects}"
+LOG_FILE="$AI_HOME/ai.log"
+
+DEFAULT_MESSENGER_MODEL="gemma3:1b"
+DEFAULT_COMBINATOR_MODEL="deepseek-r1:1.5b"
+DEFAULT_TRADER_MODEL="2244-1"
+
+MESSENGER_MODEL="${MESSENGER_MODEL:-$DEFAULT_MESSENGER_MODEL}"
+COMBINATOR_MODEL="${COMBINATOR_MODEL:-$DEFAULT_COMBINATOR_MODEL}"
+TRADER_MODEL="${TRADER_MODEL:-$DEFAULT_TRADER_MODEL}"
+
+OLLAMA_BIN="$(command -v ollama || true)"
+
+MEMORY_DB="$AI_HOME/memory.db"
+HASH_INDEX_DB="$AI_HOME/hashes.db"
+POOL_INDEX_DB="$AI_HOME/pool_index.db"
+CONFIG_DB="$AI_HOME/config.db"
+API_LOGS_DB="$AI_HOME/api_logs.db"
+
+MAX_TRIUMVIRATE_ROUNDS=3
+MAX_RAM_BYTES=2_097_152
+SWAP_DIR="$AI_HOME/swap"
+
+mkdir -p "$AI_HOME" "$PROJECTS_DIR" "$SWAP_DIR"
+
+# ---------------- COLORS ----------------
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'
+ORANGE='\033[0;33m'; NC='\033[0m'
+
+# ---------------- LOGGING ----------------
+log_to_file(){ echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$1] $2" >> "$LOG_FILE"; }
+log_debug(){ [[ "$LOG_LEVEL" == "DEBUG" ]] && printf "${PURPLE}[DEBUG][%s]${NC} %s\n" "$(date '+%T')" "$*" >&2 && log_to_file "DEBUG" "$*"; }
+log_info(){ [[ "$LOG_LEVEL" =~ ^(DEBUG|INFO)$ ]] && printf "${BLUE}[INFO][%s]${NC} %s\n" "$(date '+%T')" "$*" >&2 && log_to_file "INFO" "$*"; }
+log_warn(){ printf "${YELLOW}[WARN][%s]${NC} %s\n" "$(date '+%T')" "$*" >&2 && log_to_file "WARN" "$*"; }
+log_error(){ printf "${RED}[ERROR][%s]${NC} %s\n" "$(date '+%T')" "$*" >&2 && log_to_file "ERROR" "$*" && return 1; }
+log_success(){ printf "${GREEN}[SUCCESS][%s]${NC} %s\n" "$(date '+%T')" "$*" >&2 && log_to_file "SUCCESS" "$*"; }
+log_think(){ printf "${ORANGE}🤔 [THINK][%s]${NC} %s\n" "$(date '+%T')" "$*" >&2 && log_to_file "THINK" "$*"; }
+log_plan(){ printf "${CYAN}📋 [PLAN][%s]${NC} %s\n" "$(date '+%T')" "$*" >&2 && log_to_file "PLAN" "$*"; }
+log_execute(){ printf "${GREEN}⚡ [EXECUTE][%s]${NC} %s\n" "$(date '+%T')" "$*" >&2 && log_to_file "EXECUTE" "$*"; }
+
+# ---------------- DATABASE ----------------
+sqlite_escape(){ echo "$1" | sed "s/'/''/g"; }
+
+init_db(){
+  local dbs=("$MEMORY_DB" "$HASH_INDEX_DB" "$CONFIG_DB" "$POOL_INDEX_DB" "$API_LOGS_DB")
+  local schemas=(
+    "CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, prompt TEXT, response TEXT, pool_hash TEXT, task_hash TEXT); CREATE INDEX IF NOT EXISTS idx_prompt ON memories(prompt);"
+    "CREATE TABLE IF NOT EXISTS hashes (type TEXT, target TEXT, hash TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP);"
+    "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);"
+    "CREATE TABLE IF NOT EXISTS pools (pool_hash TEXT PRIMARY KEY, rehash_count INTEGER DEFAULT 0, tasks TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP);"
+    "CREATE TABLE IF NOT EXISTS api_logs (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, endpoint TEXT, method TEXT, payload TEXT);"
+  )
+  for i in "${!dbs[@]}"; do
+      sqlite3 "${dbs[$i]}" "${schemas[$i]}" 2>/dev/null || log_warn "DB init failed: ${dbs[$i]}"
+  done
+  log_success "Databases initialized"
+}
+
+add_to_memory_fast(){
+  local prompt="$1" response="$2" pool_hash="$3" task_hash="$4"
+  sqlite3 "$MEMORY_DB" <<SQL
+BEGIN;
+INSERT INTO memories (prompt,response,pool_hash,task_hash)
+VALUES ('$(sqlite_escape "$prompt")','$(sqlite_escape "$response")','$pool_hash','$task_hash');
+COMMIT;
+SQL
+  log_debug "Memory added (fast)"
+}
+
+# ---------------- HASH & SWAP ----------------
+hash_string(){ echo -n "$1" | sha256sum | cut -d' ' -f1; }
+
+store_output_fast(){
+    local content="$1"
+    local size_bytes=${#content}
+    local hash=$(hash_string "$content")
+    local file_path="$SWAP_DIR/$hash.txt"
+    if (( size_bytes > MAX_RAM_BYTES )); then
+        echo "$content" | gzip > "$file_path.gz"
+        log_info "Output too large (${size_bytes}B), offloaded to $file_path.gz"
+        echo "$file_path.gz"
+    else
+        echo "$content"
+    fi
+}
+
+retrieve_output_fast(){
+    local ref="$1"
+    if [[ -f "$ref" ]]; then
+        [[ "$ref" == *.gz ]] && gzip -dc "$ref" || cat "$ref"
+    else
+        echo "$ref"
+    fi
+}
+
+# ---------------- TASK POOL ----------------
+setup_task_pool(){
+    local prompt="$1"
+    local semantic_hash=$(echo "$prompt" | tr -cd 'a-zA-Z0-9' | cut -c1-32)
+    local instance_hash=$(hash_string "$prompt$(date +%s%N)" | cut -c1-16)
+    mkdir -p "$PROJECTS_DIR/$semantic_hash"
+    echo "$semantic_hash $instance_hash 1"
+}
+
+# ---------------- WORKERS ----------------
+run_worker_fast(){
+    local model="$1" system="$2" prompt="$3"
+    jq -nc --arg model "$model" --arg system "$system" --arg prompt "$prompt" \
+        '{model:$model,system:$system,prompt:$prompt,options:{temperature:0.7,top_p:0.9},stream:false}' | \
+        curl -s --max-time 10 -X POST http://localhost:11434/api/generate -H "Content-Type: application/json" -d @-
+}
+
+# ---------------- LEVENSHTEIN ----------------
+levenshtein(){
+    awk -v s1="$1" -v s2="$2" '
+    BEGIN{
+        n=length(s1); m=length(s2)
+        for(i=0;i<=n;i++) d[i,0]=i
+        for(j=0;j<=m;j++) d[0,j]=j
+        for(i=1;i<=n;i++){
+            for(j=1;j<=m;j++){
+                cost=(substr(s1,i,1)==substr(s2,j,1)?0:1)
+                d[i,j]=min(min(d[i-1,j]+1,d[i,j-1]+1),d[i-1,j-1]+cost)
+            }
+        }
+        print d[n,m]
+    }
+    function min(a,b,c){ if(c=="") c=99999; if(a<=b && a<=c) return a; else if(b<=a && b<=c) return b; else return c }'
+}
+
+semantic_hash_prompt(){ echo "$1" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9' | cut -c1-32; }
+
+# ---------------- WEIGHTED FUZZY CACHE ----------------
+get_weighted_cached_response(){
+    local prompt="$1"
+    local threshold="${2:-15}"
+    local w_sim=0.6 w_rec=0.3 w_size=0.1
+
+    local prompt_norm=$(semantic_hash_prompt "$prompt")
+    local best_score=-1
+    local best_response=""
+
+    while IFS=$'\t' read -r pool_hash response timestamp; do
+        local dist score recency_score size_score sim
+
+        dist=$(levenshtein "$prompt_norm" "$pool_hash")
+        [[ $dist -gt $threshold ]] && continue
+
+        sim=$(awk -v d="$dist" -v t="$threshold" 'BEGIN{printf "%0.6f", 1-(d/t)}')
+
+        ts_epoch=$(date -d "$timestamp" +%s 2>/dev/null || echo 0)
+        now_epoch=$(date +%s)
+        recency_score=$(awk -v now="$now_epoch" -v ts="$ts_epoch" 'BEGIN{printf "%0.6f", 1/(1+(now-ts)/86400)}')
+
+        size_score=$(awk -v ps=${#prompt_norm} -v rs=${#response} 'BEGIN{printf "%0.6f", (ps>0)?(1-(sqrt((ps-rs)^2)/ps)):1}')
+
+        score=$(awk -v s1="$sim" -v s2="$recency_score" -v s3="$size_score" -v w1="$w_sim" -v w2="$w_rec" -v w3="$w_size" \
+            'BEGIN{printf "%0.6f", w1*s1 + w2*s2 + w3*s3}')
+
+        if (( $(awk -v a="$score" -v b="$best_score" 'BEGIN{print (a>b)?1:0}') )); then
+            best_score=$score
+            best_response="$response"
+        fi
+    done < <(sqlite3 "$MEMORY_DB" "SELECT pool_hash, response, timestamp FROM memories;")
+
+    echo "$best_response"
+}
+
+# ---------------- TRIUMVIRATE ----------------
+run_triumvirate_agent_fast(){
+    local prompt="$1"
+
+    local cached
+    cached=$(get_weighted_cached_response "$prompt" 12)
+    if [[ -n "$cached" ]]; then
+        log_info "Using weighted cached response"
+        echo -e "\n✅ Weighted Cached Response:\n$(retrieve_output_fast "$cached")"
+        return
+    fi
+
+    local pool_info semantic_hash instance_hash
+    pool_info=$(setup_task_pool "$prompt")
+    semantic_hash=${pool_info%% *}
+    instance_hash=$(echo "$pool_info" | awk '{print $2}')
+
+    local final_response messenger_resp combinator_resp trader_resp
+
+    for ((i=1;i<=MAX_TRIUMVIRATE_ROUNDS;i++)); do
+        log_think "Round $i - Messenger analyzing..."
+        messenger_resp=$(run_worker_fast "$MESSENGER_MODEL" "Analyze" "$prompt")
+
+        log_plan "Combinator planning..."
+        combinator_resp=$(run_worker_fast "$COMBINATOR_MODEL" "Plan" "$messenger_resp")
+
+        log_execute "Trader executing..."
+        trader_resp=$(run_worker_fast "$TRADER_MODEL" "Execute" "$combinator_resp")
+
+        final_response="$trader_resp"
+        [[ "$trader_resp" =~ "FINAL_ANSWER" ]] && break
+    done
+
+    local stored_ref
+    stored_ref=$(store_output_fast "$final_response")
+    add_to_memory_fast "$prompt" "$stored_ref" "$semantic_hash" "$instance_hash"
+    echo -e "\n✅ Final Response:\n$(retrieve_output_fast "$stored_ref")"
+}
+
+# ---------------- CLI ----------------
+main(){
+    init_db
+    [[ $# -eq 0 ]] && { echo "Usage: $0 '<prompt>'"; exit 1; }
+    local prompt="$*"
+    run_triumvirate_agent_fast "$prompt"
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

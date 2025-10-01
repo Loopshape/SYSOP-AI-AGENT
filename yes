@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+ai.sh - AI DevOps Platform v17 - The Hybrid Loop Edition (Refined)
+A single-file agent with model selection, NAT awareness, and a continuous operation loop.
+set -euo pipefail
+IFS=$'\n\t'
+-------------------- CONFIG --------------------
+AI_HOME="${AI_HOME:-HOME/.ai\_agent}"
+PROJECTS\_DIR="{PROJECTS_DIR:-$HOME/ai_projects}"
+LOG_FILE="AI_HOME/ai.log"
+DEFAULT_MODEL="llama3.1:8b"
+OLLAMA_BIN="(command -v ollama || echo 'ollama')"
+MEMORY_DB="$AI_HOME/memory.db"
+CONFIG_DB="$AI_HOME/config.db"
+Hybrid Agent Model Configuration
+MODEL_ORDER=("core" "2244-1" "loop") # The order for octal pattern selection
+Dynamic AI parameters loaded/overridden
+AI_AGENT_MODEL="${AI_MODEL:-$DEFAULT_MODEL}"
+AI_TEMPERATURE=""
+AI_TOP_P=""
+AI_SEED=""
+Colors
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'; NC='\033[0m'
+ICON_SUCCESS="✅"; ICON_WARN="⚠️"; ICON_ERROR="❌"; ICON_INFO="ℹ️"; ICON_NET="🌐"
+-------------------- LOGGING --------------------
+log() { local msg="*"; printf "{BLUE}{ICON_INFO} [%s] %s{NC}\n" "(date '+%T')" "$msg" | tee -a "$LOG_FILE"; }
+log_success() { local msg="$*"; printf "${GREEN}{ICON_SUCCESS} [%s] %s${NC}\n" "(date '+%T')" "$msg" | tee -a "$LOG\_FILE"; }
+log\_error() { local msg="$*"; printf "${RED}{ICON_ERROR} [%s] ERROR: %s${NC}\n" "(date '+%T')" "$msg" | tee -a "$LOG_FILE"; exit 1; }
+log_warn() { local msg="$*"; printf "${YELLOW}{ICON_WARN} [%s] WARN: %s${NC}\n" "(date '+%T')" "$msg" | tee -a "$LOG\_FILE"; }
+log\_phase() { echo -e "\\n${PURPLE}🚀 %s${NC}" "*" | tee -a "$LOG_FILE"; }
+-------------------- DATABASE & CONFIG --------------------
+sqlite_escape() { echo "1" | sed "s/'/''/g"; }
+init_db() {
+sqlite3 "$CONFIG\_DB" "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);" 2\>/dev/null || true
+sqlite3 "$MEMORY_DB" "CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY, prompt TEXT, status TEXT, hash TEXT);" 2>/dev/null || true
+}
+set_config() { sqlite3 "$CONFIG\_DB" "INSERT OR REPLACE INTO config (key, value) VALUES ('$(sqlite_escape "$1")','$(sqlite_escape "$2")');" ; log\_success "Config set: $1=$2"; }
+get\_config() { sqlite3 "$CONFIG_DB" "SELECT value FROM config WHERE key='$(sqlite\_escape "$1")';" 2>/dev/null; }
+load_config_values() {
+AI_AGENT_MODEL="${AI\_MODEL:-$(get_config agent_model || echo "$DEFAULT\_MODEL")}"
+AI\_TEMPERATURE="${AI_TEMPERATURE:-$(get\_config temperature || echo "0.7")}"
+AI\_TOP\_P="${AI_TOP_P:-$(get\_config top\_p || echo "0.9")}"
+AI\_SEED="${AI_SEED:-(get_config seed || echo "")}"
+}
+-------------------- NETWORK RESOLVER (Python inside Bash) --------------------
+net_detect_nat() {
+log "${ICON_NET} Detecting network configuration (NAT) using Python/STUN..."
+# This embeds a Python script to do the STUN lookup with guaranteed socket closure
+python3 -c '
+import socket, sys
+try:
+# Attempt to import "stun" (pystun3 recommended, often imported as stun)
+import stun
+except ImportError:
+print("error: Python module 'stun' (pystun3) not found.", file=sys.stderr)
+sys.exit(1)
+def try_stun(family):
+sock = None
+try:
+# SOCK_DGRAM (UDP) is necessary for STUN
+sock = socket.socket(family, socket.SOCK_DGRAM)
+sock.settimeout(2)
+_, public_ip, _ = stun.get_ip_info(stun_host="stun.l.google.com", stun_port=19302, sock=sock)
+local_ip = sock.getsockname()[0]
+return public_ip, local_ip
+except Exception:
+return None, None
+finally:
+if sock:
+sock.close()
+public_ip, local_ip = None, None
+1. Try IPv6 STUN
+public_ip, local_ip = try_stun(socket.AF_INET6)
+2. If IPv6 failed, try IPv4 STUN
+if not public_ip or public_ip.startswith("127"):
+public_ip, local_ip = try_stun(socket.AF_INET)
+3. Fallback to local IP detection if STUN failed completely
+if not local_ip:
+try:
+# Connect to external address to get preferred source IP
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.connect(("8.8.8.8", 80))
+local_ip = s.getsockname()[0]
+s.close()
+except Exception:
+local_ip = "127.0.0.1"
+Final check for local-only determination
+if public_ip is None or public_ip.startswith("127"):
+public_ip = "N/A (local-only)"
+print(f"{public_ip}|{local_ip}")
+' || log_error "NAT detection failed. Check Python/stun module."
+}
+net_dns_to_ip() {
+python3 -c 'import socket, sys; info=socket.getaddrinfo(sys.argv[1], None, socket.AF_INET, socket.SOCK_STREAM); print(info[0][4][0])' "$1" 2>/dev/null || echo "0.0.0.0"
+}
+net_ip_to_dns() {
+python3 -c 'import socket, sys; print(socket.gethostbyaddr(sys.argv[1])[0])' "$1" 2>/dev/null || echo "unknown.local"
+}
+-------------------- AI & AGENT CORE --------------------
+ensure_dependencies() {
+# Check for basic shell tools
+if ! command -v sqlite3 &>/dev/null; then log_error "sqlite3 not found. Required for configuration and memory."; fi
+if ! command -v python3 &>/dev/null; then log_error "python3 not found. Required for network detection."; fi
+if ! command -v uuidgen &>/dev/null; then log_error "uuidgen not found. Required for project IDs."; fi
+# Check for Python modules without installing (defer installation to --setup)
+python3 -c 'import stun, requests, termcolor' 2>/dev/null || \
+    log_warn "Required Python modules (stun, requests, termcolor) are missing. Run 'ai.sh --setup'."
+
+if ! command -v "$OLLAMA_BIN" &>/dev/null; then log_error "Ollama binary not found. Please install it."; fi
+if ! curl -s http://localhost:11434/api/tags >/dev/null; then
+    log "Ollama server not running. Attempting to start it in the background..."
+    # Use nohup for daemonization robustness
+    nohup "$OLLAMA_BIN" serve >"$AI_HOME/ollama_startup.log" 2>&1 &
+    sleep 4
+    if ! curl -s http://localhost:11434/api/tags >/dev/null; then
+        log_error "Failed to start Ollama server. Check $AI_HOME/ollama_startup.log for details."
+    else
+        log_success "Ollama server started successfully."
+    fi
+fi
+
+}
+run_ai_model() {
+local model="$1"
+local prompt="$2"
+log "Running model: $model" "yellow"
+# Use array for command to handle spaces in prompt/args correctly
+local args=("$model" "$prompt")
+local output
+
+# Run Ollama with optional parameters (temperature, top_p, seed)
+local ollama_cmd=("$OLLAMA_BIN" "run" "$AI_AGENT_MODEL" \
+    -r \
+    --temperature "${AI_TEMPERATURE}" \
+    --top-p "${AI_TOP_P}")
+
+[[ -n "$AI_SEED" ]] && ollama_cmd+=(--seed "$AI_SEED")
+
+# Use a subshell to capture output and status
+output=$("${ollama_cmd[@]}" "${args[@]}" 2>&1)
+local status=$?
+
+if [[ $status -ne 0 ]]; then
+    # Check if the error is due to a missing specific model (e.g., 'core')
+    if echo "$output" | grep -q "Error: model '$model' not found"; then
+        log_warn "Model '$model' not found. Falling back to configured AI_AGENT_MODEL: $AI_AGENT_MODEL."
+        output=$("$OLLAMA_BIN" "run" "$AI_AGENT_MODEL" -r "${args[@]}" 2>&1)
+        status=$?
+    fi
+    
+    if [[ $status -ne 0 ]]; then
+        log_error "Ollama execution failed (Status: $status). Output: $output"
+    fi
+fi
+echo "$output"
+
+}
+select_models_octal() {
+local timeout=8
+local pattern=""
+local model_names_list=(IFS=','; echo "{MODEL_ORDER[*]}")
+echo -e "${YELLOW}"
+read -t "$timeout" -p "Enter octal pattern (1=run, 0=skip) for (${model_names_list}) [${timeout}s default 111]: " pattern || true
+echo -e "${NC}"
+
+if [[ ! "$pattern" =~ ^[01]{3}$ ]]; then
+    log_warn "No valid input (or timed out), defaulting to 111 (all models)."
+    pattern="111"
+fi
+
+local selected_models_str=""
+for i in "${!MODEL_ORDER[@]}"; do
+    if [[ "${pattern:i:1}" == "1" ]]; then
+        # Append model name to the string
+        selected_models_str+="${MODEL_ORDER[i]} "
+    fi
+done
+echo "$selected_models_str" | sed 's/ *$//' # Return as a trimmed space-separated string
+
+}
+run_iteration() {
+local selected_models_str="$1"
+local public_ip="$2"
+local local_ip="$3"
+local iteration_mod3="$4" # 1, 2, or 3
+# Convert space-separated string back to an array for easy checking
+local selected_models_arr=($selected_models_str)
+# The index in MODEL_ORDER is iteration_mod3 - 1
+local model_index=$((iteration_mod3 - 1))
+
+# Check if the iteration number maps to a selected model in the MODEL_ORDER array
+local current_model="${MODEL_ORDER[$model_index]}"
+local is_selected=0
+for model in "${selected_models_arr[@]}"; do
+    [[ "$model" == "$current_model" ]] && is_selected=1 && break
+done
+
+log "--- Agent Cycle $iteration_mod3/3 (Model: $current_model) ---" "magenta"
+log "Thinking..." "yellow"
+sleep 1
+
+if [[ $is_selected -eq 1 ]]; then
+    local prompt=""
+    local reply=""
+
+    if [[ "$current_model" == "core" ]]; then
+        local host="openai.com"
+        local ip=$(net_dns_to_ip "$host")
+        local rev=$(net_ip_to_dns "$ip")
+        prompt="Validate host ${host} -> ${ip} -> ${rev}. My NAT info: Public=${public_ip}, Local=${local_ip}. Provide a concise validation in one sentence."
+        reply=$(run_ai_model "core" "$prompt")
+        log "CORE: $reply" "green"
+    
+    elif [[ "$current_model" == "2244-1" ]]; then
+        local opp="Hybrid IPv6 NAT AI edge opportunities"
+        prompt="Analyze system opportunity: ${opp}. My NAT info: Public=${public_ip}, Local=${local_ip}. What is one key observation regarding edge computing?"
+        reply=$(run_ai_model "2244-1" "$prompt")
+        log "2244-1: $reply" "green"
+
+    elif [[ "$current_model" == "loop" ]]; then
+        prompt="Perform NAT-aware system reasoning based on this info: Public=${public_ip}, Local=${local_ip}. Suggest one proactive system action relevant to maintaining connectivity."
+        reply=$(run_ai_model "loop" "$prompt")
+        log "LOOP: $reply" "green"
+    fi
+
+    # Optional: Save prompt/reply to memory DB here if needed
+    # sqlite3 "$MEMORY_DB" "INSERT INTO memories (prompt, status, hash) VALUES ('$(sqlite_escape "$prompt")','success', '...')"
+fi
+
+}
+run_hybrid_agent_workflow() {
+local project_id; project_id=$(uuidgen | cut -c-16)
+local workspace="$PROJECTS_DIR/$project_id"
+mkdir -p "$workspace"
+# Set log file for this specific run inside the workspace
+local RUN_LOG_FILE="$workspace/agent.log"
+log_phase "Activating Hybrid Agent Workflow"
+log_success "Created project workspace: $workspace (Run log: $RUN_LOG_FILE)"
+
+# Temporarily override LOG_FILE to capture run data, redirecting existing log file output to run log
+exec 3>&1 # Save stdout
+exec 1> >(tee -a "$RUN_LOG_FILE") # Redirect stdout to tee (console + run log)
+LOG_FILE="$RUN_LOG_FILE" # Update variable for internal logging functions
+
+local nat_info; nat_info=$(net_detect_nat)
+local public_ip; public_ip=$(echo "$nat_info" | cut -d'|' -f1)
+local local_ip; local_ip=$(echo "$nat_info" | cut -d'|' -f2)
+
+if [[ "$public_ip" == "N/A (local-only)" ]]; then
+    log_warn "Running in local-only mode (no public IP detected)"
+fi
+log "${ICON_NET} NAT info: Public=${public_ip}, Local=${local_ip}" "cyan"
+
+local selected_models; selected_models=$(select_models_octal)
+log_info "Selected models for iterations: ${selected_models}" "cyan"
+
+# Check if any models were selected
+if [[ -z "$selected_models" ]]; then
+    log_error "No models were selected. Exiting agent."
+fi
+
+local iteration=1
+while true; do
+    run_iteration "$selected_models" "$public_ip" "$local_ip" "$iteration"
+    
+    # Cycle iteration from 1 to 3
+    iteration=$((iteration % 3 + 1)) 
+    
+    log "--- Loop cycle complete, sleeping for 8 seconds... ---" "yellow"
+    sleep 8
+done
+
+# Restore stdout
+exec 1>&3 3>&-
+
+}
+-------------------- HELP & MAIN DISPATCHER --------------------
+show_help() {
+cat << EOF
+{GREEN}AI DevOps Platform v17 - The Hybrid Loop Edition{NC}
+A self-installing agent with model selection, NAT awareness, and a continuous operation loop.
+{CYAN}USAGE:{NC}
+ai                                 # Start the interactive Hybrid Agent workflow
+ai --setup                         # Install/verify dependencies (python3-pip, stun, etc.)
+ai --config <key> <value>          # Set persistent configuration (e.g., ai --config agent_model llama2)
+ai --help                          # Show this help
+{CYAN}Configuration Keys:{NC}
+agent_model      # Default model used for generic prompts (e.g., llama3.1:8b)
+temperature      # AI generation temperature (0.0 - 1.0)
+top_p            # AI generation top-p value (0.0 - 1.0)
+seed             # AI generation seed for reproducibility
+EOF
+}
+main() {
+mkdir -p "$AI_HOME" "$PROJECTS_DIR"
+init_db
+load_config_values
+# Check for specific arguments first
+case "${1:-}" in
+    --setup|-s)
+        log "Installing/verifying system dependencies (python3-pip, openssl, uuidgen)..."
+        if command -v apt-get &>/dev/null; then
+            sudo apt-get update && sudo apt-get install -y python3-pip openssl uuid-runtime || log_warn "apt-get dependencies failed."
+        fi
+        
+        # Use --break-system-packages for modern pip environments or --user otherwise
+        if pip3 install --help 2>&1 | grep -q "break-system-packages"; then
+            PIP_FLAGS="--break-system-packages"
+        else
+            PIP_FLAGS="--user"
+        fi
+
+        log "Installing required Python modules (termcolor, requests, pystun3)..."
+        pip3 install $PIP_FLAGS -q termcolor requests pystun3
+        log_success "Setup complete. Please ensure Ollama is installed and running."
+        ;;
+    --config)
+        if [[ $# -ne 3 ]]; then log_error "Usage: ai --config <key> <value>"; fi
+        set_config "$2" "$3"
+        ;;
+    --help|-h) show_help ;;
+    *)
+        # Default action: run agent
+        log_phase "Initializing AI Agent ($AI_AGENT_MODEL) and checking environment..."
+        ensure_dependencies
+        run_hybrid_agent_workflow
+        ;;
+esac
+
+}
+--- ENTRY POINT ---
+Use trap to ensure graceful exit on Ctrl+C
+trap 'log_warn "\nAgent stopped manually (Ctrl+C)."; exit 0' INT TERM
+main "$@"

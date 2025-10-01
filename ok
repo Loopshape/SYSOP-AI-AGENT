@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""
+HybridAgent single-file executable with octal pattern and infinite loop
+- Auto-installs dependencies
+- NAT detection (IPv6 → IPv4 → local-only)
+- Octal pattern model selection (binary 1=run, 0=skip)
+- Auto-resume after 8s default all
+- Infinite loop of iterations
+"""
+
+import os
+import sys
+import subprocess
+import time
+import uuid
+import socket
+import threading
+
+# Auto-install modules
+REQUIRED_MODULES = ["termcolor", "requests", "stun"]
+
+def ensure_modules():
+    import importlib
+    for module in REQUIRED_MODULES:
+        try:
+            importlib.import_module(module)
+        except ImportError:
+            print(f"⚠️ Installing missing module '{module}'...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", module])
+
+ensure_modules()
+
+from termcolor import colored
+import stun
+import requests
+
+# Backend client
+class OllamaClient:
+    def __init__(self, host="http://localhost:11434", timeout=60):
+        self.host = host.rstrip("/")
+        self.timeout = timeout
+
+    def run(self, model: str, prompt: str):
+        url = f"{self.host}/api/generate"
+        payload = {"model": model, "prompt": prompt}
+        try:
+            r = requests.post(url, json=payload, timeout=self.timeout)
+            r.raise_for_status()
+            return r.json().get("response", "")
+        except Exception as e:
+            return f"⚠️ Ollama call failed: {e}"
+
+class NetResolver:
+    @staticmethod
+    def dns_to_ip(host: str) -> str:
+        try:
+            info = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+            return info[0][4][0]
+        except Exception:
+            return "0.0.0.0"
+
+    @staticmethod
+    def ip_to_dns(ip: str) -> str:
+        try:
+            return socket.gethostbyaddr(ip)[0]
+        except Exception:
+            return "unknown.local"
+
+    @staticmethod
+    def detect_nat():
+        public_ip, local_ip = None, None
+        try:
+            sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+            sock.settimeout(3)
+            _, public_ip, _ = stun.get_ip_info("stun.l.google.com", 19302, sock)
+            local_ip = sock.getsockname()[0]
+            sock.close()
+        except Exception:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.settimeout(3)
+                _, public_ip, _ = stun.get_ip_info("stun.l.google.com", 19302, sock)
+                local_ip = sock.getsockname()[0]
+                sock.close()
+            except Exception:
+                local_ip = socket.gethostbyname(socket.gethostname())
+                public_ip = None
+        if public_ip is None or public_ip.startswith("127"):
+            public_ip = "N/A (local-only)"
+        return public_ip, local_ip
+
+# Hybrid Agent
+class HybridAgent:
+    MODEL_ORDER = ["core", "2244-1", "loop"]  # hundreds, tens, ones
+
+    def __init__(self):
+        self.project_id = uuid.uuid4().hex[:16]
+        self.workspace = f"/home/loop/ai_projects/{self.project_id}"
+        os.makedirs(self.workspace, exist_ok=True)
+        self.client = OllamaClient()
+        self.resolver = NetResolver()
+        self.log_file = os.path.join(self.workspace, "agent.log")
+
+    def log(self, msg, color="white"):
+        ts = time.strftime("[%H:%M:%S]")
+        line = f"{ts} {msg}"
+        print(colored(line, color))
+        with open(self.log_file, "a") as f:
+            f.write(line + "\n")
+
+    def select_models_octal(self, timeout=8):
+        """Prompt user for octal pattern; default all after timeout"""
+        octal_input = [None]
+
+        def prompt_thread():
+            try:
+                octal_input[0] = input(
+                    f"Enter octal pattern (hundreds=core, tens=2244-1, ones=loop) [8s default 777]: "
+                ).strip()
+            except EOFError:
+                octal_input[0] = None
+
+        t = threading.Thread(target=prompt_thread)
+        t.start()
+        t.join(timeout)
+
+        pattern = octal_input[0]
+        if not pattern or len(pattern) != 3 or not all(c in "01" for c in pattern):
+            print("\n⏱ No valid input, defaulting to 777 (all models).")
+            pattern = "111"  # binary 1=run, 0=skip
+
+        selected = [model for bit, model in zip(pattern, self.MODEL_ORDER) if bit == "1"]
+        return selected
+
+    def run_iteration(self, selected_models, public_ip, local_ip, iteration):
+        self.log(f"Agent Iteration {iteration}/3", "magenta")
+        self.log("Thinking...", "yellow")
+        time.sleep(1)
+
+        if "core" in selected_models and iteration == 1:
+            host = "openai.com"
+            ip = self.resolver.dns_to_ip(host)
+            rev = self.resolver.ip_to_dns(ip)
+            prompt = f"Validate host {host} -> {ip} -> {rev}. NAT info: Public={public_ip}, Local={local_ip}"
+            reply = self.client.run("core", prompt)
+            self.log(f"CORE: {reply}", "green")
+
+        if "2244-1" in selected_models and iteration == 2:
+            prompt = f"Analyze opportunity. NAT info: Public={public_ip}, Local={local_ip}"
+            reply = self.client.run("2244-1", prompt)
+            self.log(f"2244-1: {reply}", "green")
+
+        if "loop" in selected_models and iteration == 3:
+            prompt = f"NAT-aware system reasoning. Public={public_ip}, Local={local_ip}"
+            reply = self.client.run("loop", prompt)
+            self.log(f"LOOP: {reply}", "green")
+
+    def run(self):
+        self.log("Activating Agent in Mode: agent", "magenta")
+        self.log(f"Created project workspace: {self.workspace}", "green")
+
+        public_ip, local_ip = self.resolver.detect_nat()
+        if public_ip == "N/A (local-only)":
+            self.log("⚠️ Running in local-only mode (no public IP)", "red")
+        self.log(f"NAT info: Public={public_ip}, Local={local_ip}", "cyan")
+
+        selected_models = self.select_models_octal(timeout=8)
+        self.log(f"Selected models for iterations: {', '.join(selected_models)}", "cyan")
+
+        iteration = 1
+        try:
+            while True:  # infinite loop
+                self.run_iteration(selected_models, public_ip, local_ip, iteration)
+                iteration = iteration + 1 if iteration < 3 else 1
+        except KeyboardInterrupt:
+            self.log("Agent stopped manually (Ctrl+C)", "red")
+
+
+if __name__ == "__main__":
+    agent = HybridAgent()
+    agent.run()

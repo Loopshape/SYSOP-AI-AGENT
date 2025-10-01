@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+# ------------------------
+# ai-cli v360: recursive ref parser + dynamic SQL file hashing
+# Termux/Proot-safe
+# ------------------------
+
+CLI_HOME="${CLI_HOME:-$HOME/.local/cli}"
+DB="${DB:-$CLI_HOME/cli.sqlite}"
+SNAPSHOT_DIR="${SNAPSHOT_DIR:-$CLI_HOME/snapshots}"
+VERBOSE=${VERBOSE:-1}
+DRY_RUN=0
+
+mkdir -p "$CLI_HOME" "$SNAPSHOT_DIR"
+
+# ------------------------
+# Utilities
+# ------------------------
+log() {
+    local level="$1"
+    shift
+    local msg="$*"
+    if [[ $VERBOSE -ge $level ]]; then
+        echo "[cli] $msg"
+    fi
+}
+
+error() {
+    echo "[cli][ERROR] $*" >&2
+}
+
+sql_escape() {
+    printf "%s" "$1" | sed "s/'/''/g"
+}
+
+run_sql() {
+    local sql="$1"
+    if [[ $DRY_RUN -eq 1 ]]; then
+        log 2 "DRY-RUN SQL: $sql"
+    else
+        sqlite3 "$DB" "$sql"
+    fi
+}
+
+sha256_file() {
+    sha256sum "$1" | awk '{print $1}'
+}
+
+# ------------------------
+# DB init for hashes
+# ------------------------
+init_db() {
+    run_sql "CREATE TABLE IF NOT EXISTS file_hashes(
+        id INTEGER PRIMARY KEY,
+        path TEXT UNIQUE,
+        hash TEXT,
+        status TEXT,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    );"
+    run_sql "CREATE TABLE IF NOT EXISTS file_hash_events(
+        id INTEGER PRIMARY KEY,
+        path TEXT,
+        old_hash TEXT,
+        new_hash TEXT,
+        event_type TEXT,
+        ts DATETIME DEFAULT CURRENT_TIMESTAMP
+    );"
+    log 1 "DB initialized with hash tables"
+}
+
+# ------------------------
+# Recursive file discovery
+# ------------------------
+resolve_ref_to_abs() {
+    local base="$1"
+    local ref="$2"
+    if [[ -z "$ref" ]]; then
+        echo ""
+        return
+    fi
+    ref=$(echo "$ref" | sed -E "s/^['\"]|['\"]$//g; s/^\s+|\s+$//g")
+    if [[ "$ref" =~ ^(https?:|//|data:|mailto:) ]]; then
+        echo ""
+        return
+    fi
+    if [[ "$ref" == /* ]]; then
+        readlink -f "$ref" 2>/dev/null || echo ""
+        return
+    fi
+    readlink -f "$base/$ref" 2>/dev/null || echo ""
+}
+
+extract_refs_from_file() {
+    local file="$1"
+    if [[ ! -f "$file" ]]; then return 0; fi
+    # Safe fallback: extract src/href/include/require/import
+    grep -Eo '(src|href|include|require|import)["\']?[^"'" ]+["\']?' "$file" 2>/dev/null | sed -E 's/.*["\']([^"\']+)["\']?.*/\1/' || true
+}
+
+follow_refs() {
+    local start="$1"
+    local visited_file
+    visited_file=$(mktemp)
+    trap 'rm -f "$visited_file"' EXIT
+
+    _enqueue() {
+        local f="$1"
+        echo "$f" >> "$visited_file"
+    }
+
+    if [[ -d "$start" ]]; then
+        find "$start" -type f | while IFS= read -r f; do
+            _enqueue "$(readlink -f "$f")"
+        done
+    elif [[ -f "$start" ]]; then
+        _enqueue "$(readlink -f "$start")"
+    else
+        error "start path not found: $start"
+        return 1
+    fi
+
+    local idx=1
+    while true; do
+        local total
+        total=$(wc -l < "$visited_file")
+        if [[ $idx -gt $total ]]; then break; fi
+        local current
+        current=$(sed -n "${idx}p" "$visited_file")
+        idx=$((idx+1))
+        [[ -f "$current" ]] || continue
+        log 2 "parsing: $current"
+        while IFS= read -r ref; do
+            [[ -z "$ref" ]] && continue
+            local absref
+            absref=$(resolve_ref_to_abs "$(dirname "$current")" "$ref")
+            if [[ -n "$absref" && -f "$absref" ]]; then
+                if ! grep -qxF "$absref" "$visited_file"; then
+                    echo "$absref" >> "$visited_file"
+                    log 2 "discovered: $absref"
+                fi
+            fi
+        done < <(extract_refs_from_file "$current")
+    done
+
+    cat "$visited_file"
+}
+
+# ------------------------
+# Hashing operations
+# ------------------------
+hash_files() {
+    local start="$1"
+    local f h old event_type
+    local paths
+    paths=$(follow_refs "$start")
+    while IFS= read -r f; do
+        [[ -f "$f" ]] || continue
+        h=$(sha256_file "$f")
+        old=$(sqlite3 "$DB" "SELECT hash FROM file_hashes WHERE path='$(sql_escape "$f")';")
+        event_type="hash"
+        if [[ -n "$old" && "$old" != "$h" ]]; then
+            event_type="rehash"
+        fi
+        run_sql "INSERT INTO file_hashes(path, hash, status, updated_at)
+                 VALUES('$(sql_escape "$f")','$h','${event_type}d', CURRENT_TIMESTAMP)
+                 ON CONFLICT(path) DO UPDATE SET hash=excluded.hash,status=excluded.status,updated_at=excluded.updated_at;"
+        run_sql "INSERT INTO file_hash_events(path, old_hash, new_hash, event_type)
+                 VALUES('$(sql_escape "$f")','$old','$h','$event_type');"
+        log 1 "$event_type: $f -> $h"
+    done <<< "$paths"
+}
+
+hashed() { sqlite3 "$DB" "SELECT path,hash,status,updated_at FROM file_hashes ORDER BY updated_at DESC;"; }
+hashing() { sqlite3 "$DB" "SELECT path,status FROM file_hashes WHERE status='hashing' ORDER BY updated_at DESC;"; }
+rehashed() { sqlite3 "$DB" "SELECT path,old_hash,new_hash,updated_at FROM file_hash_events WHERE event_type='rehash' ORDER BY ts DESC;"; }
+rehashings() { sqlite3 "$DB" "SELECT path,old_hash,new_hash,event_type,ts FROM file_hash_events ORDER BY ts DESC;"; }
+
+# ------------------------
+# CLI parsing
+# ------------------------
+show_help() {
+    cat <<EOF
+Usage: ai <command> [args...]
+
+Commands:
+  init-db
+  follow-refs <start>
+  hash <start>
+  rehash <start>
+  hashed
+  hashing
+  rehashed
+  rehashings
+  -v|-vv, --dry-run
+  -h|--help
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --dry-run) DRY_RUN=1; shift ;;
+        -v) VERBOSE=1; shift ;;
+        -vv) VERBOSE=2; shift ;;
+        -vvv) VERBOSE=3; shift ;;
+        --) shift; break ;;
+        *) break ;;
+    esac
+done
+
+[[ $# -lt 1 ]] && { show_help; exit 1; }
+cmd="$1"
+shift
+
+case "$cmd" in
+    init-db) init_db ;;
+    follow-refs) follow_refs "${1:-.}" ;;
+    hash) hash_files "${1:-.}" ;;
+    rehash) hash_files "${1:-.}" ;;
+    hashed) hashed ;;
+    hashing) hashing ;;
+    rehashed) rehashed ;;
+    rehashings) rehashings ;;
+    -h|--help) show_help ;;
+    *) error "unknown command: $cmd"; show_help; exit 1 ;;
+esac
