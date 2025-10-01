@@ -1,277 +1,206 @@
 #!/usr/bin/env bash
+# AI Autonomic Synthesis Platform v50.0 (The Architect Ultimate)
+# Mandatory execution: ~/bin/ai
 set -euo pipefail
 IFS=$'\n\t'
 
-# ---------------- CONFIG ----------------
-PROJECT_DIR="${PROJECT_DIR:-$HOME/.local_ai}"
-BUILD_DIR="$PROJECT_DIR/dist"
-HASH_INDEX_DIR="${HASH_INDEX_DIR:-$PROJECT_DIR/.hash_index}"
-HASH_DB="$HASH_INDEX_DIR/hash_registry.db"
-PID_FILE="$PROJECT_DIR/server.pid"
-WATCHDOG_LOG="$PROJECT_DIR/watchdog.log"
-WATCHDOG_INTERVAL=30  # seconds
-SERVE_HOST="127.0.0.1"
-SERVE_PORT="8888"
+# =========================
+# 1. ENVIRONMENT & PATHS
+# =========================
+AI_HOME="${AI_HOME:-$HOME/.local_ai}"
+PROJECTS_DIR="$AI_HOME"
+LOG_DIR="$AI_HOME/logs"
+TMP_DIR="$AI_HOME/tmp"
+SWAP_DIR="$AI_HOME/swap"
+CORE_DB="$AI_HOME/agent_core.db"
+TASK_DB="$AI_HOME/ai_task_manager.db"
+LOG_FILE="$LOG_DIR/system.log"
+HMAC_SECRET_KEY="$AI_HOME/secret.key"
+WALLET_MNEMONIC="${WALLET_MNEMONIC:-}"
 
-# ---------------- LOGGING ----------------
-log() { local lvl="$1"; local msg="$2"; printf "[%s] %s %s\n" "$lvl" "$(date '+%H:%M:%S')" "$msg"; }
-log_info() { log "INFO" "$1"; }
-log_warn() { log "WARN" "$1"; }
-log_error() { log "ERROR" "$1"; exit 1; }
-log_success() { log "SUCCESS" "$1"; }
+# =========================
+# 2. AI MODELS & AGENT PARAMS
+# =========================
+MODELS=("core" "coin" "code" "loop" "2244")
+MAX_AGENT_LOOPS=${MAX_AGENT_LOOPS:-12}
+MAX_RAM_BYTES=2097152
 
-# ---------------- HASH SYSTEM ----------------
-init_hash_system() {
-    mkdir -p "$HASH_INDEX_DIR"
-    sqlite3 "$HASH_DB" "CREATE TABLE IF NOT EXISTS hash_registry (
-        hash TEXT PRIMARY KEY,
-        original_hash TEXT,
-        content_ref TEXT,
-        timestamp INTEGER,
-        rehash_count INTEGER DEFAULT 0,
-        last_accessed INTEGER
-    );" 2>/dev/null || true
+# =========================
+# 3. COLORS & ICONS
+# =========================
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
+PURPLE='\033[0;35m'; CYAN='\033[0;36m'; ORANGE='\033[0;33m'; NC='\033[0m'
+ICON_SUCCESS="✅"; ICON_WARN="⚠️"; ICON_ERROR="❌"; ICON_INFO="ℹ️"; ICON_TASK="📝"
+
+# =========================
+# 4. LOGGING
+# =========================
+mkdir -p "$LOG_DIR" "$TMP_DIR" "$SWAP_DIR"
+
+log_to_file(){ echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"; }
+log_msg(){ local clr="$1" icon="$2" lvl="$3" msg="$4"; echo -e "${clr}[$lvl][${icon}] $(date '+%T') $msg${NC}"; log_to_file "[$lvl] $msg"; }
+log_info(){ log_msg "$BLUE" "$ICON_INFO" "INFO" "$1"; }
+log_warn(){ log_msg "$YELLOW" "$ICON_WARN" "WARN" "$1"; }
+log_error(){ log_msg "$RED" "$ICON_ERROR" "ERROR" "$1"; }
+log_success(){ log_msg "$GREEN" "$ICON_SUCCESS" "SUCCESS" "$1"; }
+log_task(){ log_msg "$ORANGE" "$ICON_TASK" "TASK" "$1"; }
+
+# =========================
+# 5. HASH FUNCTIONS
+# =========================
+hash_string(){ echo -n "$1" | sha256sum | awk '{print $1}'; }
+hash_string_salt(){ echo -n "$1${2:-salt}" | sha256sum | awk '{print $1}'; }
+hash_file(){ local f="$1"; local algo="${2:-sha256}"; case "$algo" in sha256) sha256sum "$f" | awk '{print $1}' ;; sha512) sha512sum "$f" | awk '{print $1}' ;; md5) md5sum "$f" | awk '{print $1}' ;; esac }
+hash_dir(){ find "$1" -type f -exec sha256sum {} + | sort | sha256sum | awk '{print $1}'; }
+
+# =========================
+# 6. DATABASE INIT
+# =========================
+sqlite_escape(){ echo "$1" | sed "s/'/''/g"; }
+
+init_task_db(){
+    [[ -f "$TASK_DB" ]] || sqlite3 "$TASK_DB" <<SQL
+CREATE TABLE projects (hash TEXT PRIMARY KEY, path TEXT NOT NULL, ts DATETIME DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE file_hashes (project_hash TEXT, file_path TEXT, file_hash TEXT, rehashed INTEGER DEFAULT 0, PRIMARY KEY(project_hash,file_path));
+CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts DATETIME DEFAULT CURRENT_TIMESTAMP, type TEXT, data TEXT);
+SQL
 }
 
-store_hashed_content() {
-    local content="$*"
-    local hash=$(echo -n "$content" | sha256sum | cut -d' ' -f1)
-    local file="$HASH_INDEX_DIR/${hash}.content"
-    echo "$content" > "$file"
-    sqlite3 "$HASH_DB" "INSERT OR REPLACE INTO hash_registry (hash, original_hash, content_ref, timestamp, last_accessed)
-                        VALUES ('$hash', '$hash', '$file', strftime('%s','now'), strftime('%s','now'));"
-    echo "$hash"
+init_core_db(){
+    [[ -f "$CORE_DB" ]] || sqlite3 "$CORE_DB" <<SQL
+CREATE TABLE memories (id INTEGER PRIMARY KEY, prompt_hash TEXT, prompt TEXT, response_ref TEXT);
+CREATE TABLE tool_logs (id INTEGER PRIMARY KEY, task_id TEXT, tool_name TEXT, args TEXT, result TEXT);
+SQL
 }
 
-force_rehash_content() {
-    local content="$*"
-    local timestamp=$(date +%s)
-    local new_hash=$(echo -n "${content}${timestamp}" | sha256sum | cut -d' ' -f1)
-    local file="$HASH_INDEX_DIR/${new_hash}.content"
-    echo "$content" > "$file"
-    sqlite3 "$HASH_DB" "INSERT INTO hash_registry (hash, original_hash, content_ref, timestamp, last_accessed, rehash_count)
-                        VALUES ('$new_hash', '$new_hash', '$file', $timestamp, $timestamp, 1);"
-    echo "$new_hash"
-}
+# =========================
+# 7. UTILITY FUNCTIONS
+# =========================
+store_output_fast(){ local c="$1" h; h=$(hash_string "$c"); if ((${#c}>MAX_RAM_BYTES)); then f="$SWAP_DIR/$h.txt.gz"; echo "$c"|gzip>"$f"; echo "$f"; else echo "$c"; fi; }
+retrieve_output_fast(){ local r="$1"; [[ -f "$r" ]] && ([[ "$r" == *.gz ]] && gzip -dc "$r" || cat "$r") || echo "$r"; }
 
-retrieve_hashed_content() {
-    local hash="$1"
-    local file="$HASH_INDEX_DIR/${hash}.content"
-    [[ -f "$file" ]] && cat "$file" || echo "Content not found for hash: $hash"
-}
+calculate_hmac(){ local data="$1"; [[ -f "$HMAC_SECRET_KEY" ]] && secret=$(<"$HMAC_SECRET_KEY") || secret="default-secret"; echo -n "$data" | openssl dgst -sha256 -hmac "$secret" | awk '{print $2}'; }
 
-rehash_stats() {
-    sqlite3 "$HASH_DB" "SELECT COUNT(*), SUM(rehash_count) FROM hash_registry;" | \
-    awk -F'|' '{print "📊 Entries: "$1"\n🔁 Total Rehashes: "$2}'
-}
+confirm_action(){ read -p "$(echo -e "${YELLOW}PROPOSED ACTION:${NC} $1\nApprove? [y/N] ")" -n 1 -r c || true; echo; [[ "${c:-}" =~ ^[Yy]$ ]]; }
 
-# ---------------- SERVER ----------------
-start_server() {
-    node <<'NODE' &
-import express from 'express';
-import { createServer } from 'http';
-import path from 'path';
-import { fileURLToPath } from 'url';
+# =========================
+# 8. PROJECT MANAGEMENT
+# =========================
+ingest_repo(){ local repo="$1"; [[ -d "$repo" ]] || { log_error "Repo not found: $repo"; return 1; }; local hash=$(hash_string "$repo"); sqlite3 "$TASK_DB" "INSERT OR IGNORE INTO projects(hash,path) VALUES('$(sqlite_escape "$hash")','$(sqlite_escape "$repo")');"; find "$repo" -type f | while read -r f; do fh=$(hash_file "$f"); sqlite3 "$TASK_DB" "INSERT OR REPLACE INTO file_hashes(project_hash,file_path,file_hash,rehashed) VALUES('$(sqlite_escape "$hash")','$(sqlite_escape "$f")','$fh',0);"; done; log_task "Repo ingested: $repo -> $hash"; echo "$hash"; }
 
-const app = express();
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const distPath = path.join(process.env.PROJECT_DIR || __dirname, "dist");
-app.use(express.static(distPath));
-app.get("*", (req, res) => res.sendFile(path.join(distPath, "index.html")));
-const host = process.env.SERVE_HOST || "127.0.0.1";
-const port = process.env.SERVE_PORT || 8888;
-createServer(app).listen(port, host, () => {
-    console.log(`[SUCCESS] Server running at http://${host}:${port}`);
-});
-NODE
-    SERVER_PID=$!
-    echo "$SERVER_PID" > "$PID_FILE"
-    log_info "Server PID: $SERVER_PID (stored in $PID_FILE)"
-}
+rehash_repo_files(){ local hash="$1"; find "$(sqlite3 "$TASK_DB" "SELECT path FROM projects WHERE hash='$(sqlite_escape "$hash")' LIMIT 1;")" -type f | while read -r f; do fh=$(hash_file "$f"); sqlite3 "$TASK_DB" "UPDATE file_hashes SET file_hash='$fh', rehashed=1 WHERE project_hash='$(sqlite_escape "$hash")' AND file_path='$(sqlite_escape "$f")';"; done; log_task "Rehash completed for $hash"; }
 
-serve_project() {
-    log_info "Ensuring build..."
-    [[ ! -f "$BUILD_DIR/index.html" ]] && vite build
-    start_server
-
-    # Self-test
-    sleep 2
-    if curl -s --head "http://${SERVE_HOST}:${SERVE_PORT}/index.html" | grep -q "200 OK"; then
-        log_success "Self-test passed: index.html reachable"
-    else
-        log_warn "Self-test failed: index.html not reachable"
-    fi
-
-    # Watchdog in daemon mode
-    if [[ "${AI_MODE:-}" == "daemon" ]] || [[ "${1:-}" == "--daemon" ]]; then
-        log_info "Daemon mode: starting persistent watchdog..."
-        nohup bash -c "watchdog_loop" >> "$WATCHDOG_LOG" 2>&1 &
-    fi
-}
-
-watchdog_loop() {
-    log_info "Watchdog started (interval: ${WATCHDOG_INTERVAL}s)"
-    while true; do
-        if [[ -f "$PID_FILE" ]]; then
-            SERVER_PID=$(cat "$PID_FILE")
-        fi
-
-        if [[ -z "${SERVER_PID:-}" ]] || ! ps -p "$SERVER_PID" > /dev/null 2>&1; then
-            log_warn "Server not running, restarting..."
-            serve_project &
-            sleep 5
-            SERVER_PID=$(cat "$PID_FILE")
-            log_success "Server restarted (PID: $SERVER_PID)"
-        else
-            if curl -s --head "http://${SERVE_HOST}:${SERVE_PORT}/index.html" | grep -q "200 OK"; then
-                log_info "Health-check OK (PID: $SERVER_PID)"
-            else
-                log_warn "Server PID $SERVER_PID running but index.html not reachable. Restarting..."
-                kill -9 "$SERVER_PID" || true
-                serve_project &
-                sleep 5
-                SERVER_PID=$(cat "$PID_FILE")
-                log_success "Server self-healed (PID: $SERVER_PID)"
-            fi
-        fi
-        sleep "$WATCHDOG_INTERVAL"
-    done
-}
-
-status_check() {
-    if [[ -f "$PID_FILE" ]]; then
-        SERVER_PID=$(cat "$PID_FILE")
-    fi
-
-    if [[ -n "${SERVER_PID:-}" ]] && ps -p "$SERVER_PID" > /dev/null 2>&1; then
-        if curl -s --head "http://${SERVE_HOST}:${SERVE_PORT}/index.html" | grep -q "200 OK"; then
-            log_success "Server running (PID $SERVER_PID) ✅"
-        else
-            log_warn "Server process alive, but index.html not reachable ❌"
-        fi
-    else
-        log_error "No server running"
-    fi
-}
-
-stop_server() {
-    if [[ -f "$PID_FILE" ]]; then
-        SERVER_PID=$(cat "$PID_FILE")
-    fi
-    if [[ -n "${SERVER_PID:-}" ]] && ps -p "$SERVER_PID" > /dev/null 2>&1; then
-        kill -9 "$SERVER_PID" || true
-        rm -f "$PID_FILE"
-        log_success "Stopped server (PID $SERVER_PID)"
-        unset SERVER_PID
-    else
-        log_warn "No server found to stop"
-    fi
-}
-
-restart_server() {
-    stop_server
-    serve_project
-    status_check
-}
-
-# ---------------- SELF-HEAL / FIX ----------------
-fix_system() {
-    log_info "Running self-heal..."
-
-    # Remove merge conflict markers
-    find "$PROJECT_DIR" -type f \( -name "*.js" -o -name "*.ts" -o -name "*.tsx" -o -name "*.json" \) \
-        -exec sed -i '/^<<<<<<<\|^=======\|^>>>>>>>/d' {} +
-    log_success "Removed merge conflict markers"
-
-    # Reinstall dependencies
-    npm install || log_warn "npm install failed"
-
-    # Rebuild Vite
-    if vite build &>/dev/null; then
-        log_success "Vite build succeeded"
-    else
-        log_warn "Vite build failed"
-    fi
-
-    # Start test server
-    ./ai.sh serve --daemon &>/dev/null &
-    sleep 3
-    HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://${SERVE_HOST}:${SERVE_PORT}/index.html")
-    if [[ "$HTTP_STATUS" == "200" ]]; then
-        log_success "Server reachable (HTTP 200 OK)"
-    else
-        log_warn "Server not reachable (HTTP $HTTP_STATUS)"
-    fi
-
-    # Test hash system
-    TEST_HASH=$(./ai.sh --hash "Self-check content")
-    if [[ -n "$TEST_HASH" ]]; then
-        log_success "Hash system functional (Test hash: $TEST_HASH)"
-        ./ai.sh --hashed "$TEST_HASH" &>/dev/null && log_success "Content retrieval OK"
-    else
-        log_warn "Hash system failed"
-    fi
-
-    # Watchdog log check
-    if [[ -f "$WATCHDOG_LOG" ]]; then
-        tail -n 5 "$WATCHDOG_LOG"
-    else
-        log_warn "Watchdog log not found"
-    fi
-
-    # Stop test server
-    if [[ -f "$PID_FILE" ]]; then
-        SERVER_PID=$(cat "$PID_FILE")
-        if ps -p "$SERVER_PID" > /dev/null 2>&1; then
-            kill -9 "$SERVER_PID" || true
-            rm -f "$PID_FILE"
-            log_info "Test server stopped (PID $SERVER_PID)"
-        fi
-    fi
-
-    log_success "Self-heal and self-check complete ✅"
-}
-
-# ---------------- HELP ----------------
-show_help() {
-    cat <<EOF
-Usage: ai [command] [options]
-
-Lifecycle:
-  serve              Start server
-  status             Check server status
-  restart            Restart server
-  stop               Stop server
-
-Maintenance:
-  --fix              Self-heal repo (remove conflict markers, rebuild, self-check)
-  --help             Show this help message
-
-Hashing:
-  --hash "text"      Store text and return hash
-  --rehash "text"    Force rehash text
-  --hashed <hash>    Retrieve content by hash
-  --rehashed         Show rehash statistics
-EOF
-}
-
-# ---------------- MAIN ----------------
-main() {
-    init_hash_system
-
-    case "${1:-}" in
-        serve)       shift; serve_project "$@" ;;
-        status)      status_check ;;
-        restart)     restart_server ;;
-        stop)        stop_server ;;
-        --fix)       fix_system ;;
-        --help)      show_help ;;
-        --hash)      shift; store_hashed_content "$*" ;;
-        --rehash)    shift; force_rehash_content "$*" ;;
-        --hashed)    shift; retrieve_hashed_content "$1" ;;
-        --rehashed)  rehash_stats ;;
-        *)           log_info "Unknown command. Use --help" ;;
+# =========================
+# 9. FILE PARSING & MIME HANDLING
+# =========================
+process_file(){
+    local f="$1"
+    local mimetype
+    mimetype=$(file --mime-type -b "$f")
+    case "$mimetype" in
+        text/*) log_info "Text file: $f";;
+        image/*) log_info "Image file: $f";;
+        application/zip) log_info "Archive: $f";;
+        *) log_info "Other file: $f";;
     esac
 }
 
-main "$@"
+# =========================
+# 10. WALLET & BTC SIM
+# =========================
+wallet_cli_connect(){
+    [[ -z "$WALLET_MNEMONIC" ]] && { log_warn "No wallet mnemonic set."; return 1; }
+    log_info "Wallet connected (mnemonic provided)"
+}
+
+btc_analyze(){
+    log_task "Simulating BTC market analysis..."
+    echo "BTC/USD market analysis generated (simulation)"
+}
+
+btc_trade(){
+    local action="$1"
+    log_task "Simulated BTC $action executed"
+}
+
+# =========================
+# 11. AGI WORKFLOW
+# =========================
+run_agi_workflow(){
+    local prompt="$*"
+    local task_id=$(hash_string "$prompt$(date +%s%N)" | cut -c1-16)
+    local workspace="$PROJECTS_DIR/task-$task_id"
+    mkdir -p "$workspace"
+    log_success "Project workspace: $workspace (Task ID: $task_id)"
+
+    local loop=1 conversation_history="$prompt"
+    while [[ $loop -le $MAX_AGENT_LOOPS ]]; do
+        log_info "AGI Loop $loop/$MAX_AGENT_LOOPS"
+
+        for model in "${MODELS[@]}"; do
+            log_info "[$model] thinking..."
+            sleep 0.1 # simulate thinking
+        done
+
+        loop=$((loop+1))
+    done
+
+    log_success "AGI workflow complete"
+}
+
+# =========================
+# 12. MAIN DISPATCHER
+# =========================
+main(){
+    init_task_db
+    init_core_db
+    mkdir -p "$PROJECTS_DIR"
+
+    local cmd="${1:-}"
+
+    case "$cmd" in
+        -h|--help|help)
+            cat <<EOF
+Usage: ai <command> [options]
+
+Commands:
+  <prompt>             Run AGI workflow
+  ingest <path>        Ingest project
+  rehash <hash>        Rehash project files
+  btc analyze          BTC market analysis
+  btc buy|sell         Simulate BTC trade
+  wallet connect       Connect wallet via mnemonic
+EOF
+            ;;
+        ingest)
+            shift
+            ingest_repo "$@"
+            ;;
+        rehash)
+            shift
+            rehash_repo_files "$@"
+            ;;
+        btc)
+            shift
+            case "$1" in
+                analyze) btc_analyze ;;
+                buy|sell) btc_trade "$1" ;;
+                *) log_warn "Unknown btc command" ;;
+            esac
+            ;;
+        wallet)
+            shift
+            case "$1" in connect) wallet_cli_connect ;; *) log_warn "Unknown wallet command" ;; esac
+            ;;
+        *)
+            run_agi_workflow "$*"
+            ;;
+    esac
+}
+
+# =========================
+# 13. SCRIPT ENTRY POINT
+# =========================
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
