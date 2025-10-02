@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+# mega_ai_cli_ci.sh - CI-friendly Universal AI CLI
+# Fully automated: applies fixes, produces patch + JSON summary
+
+set -euo pipefail
+IFS=$'\n\t'
+
+AI_HOME="${AI_HOME:-$HOME/.ai_agent}"
+PROJECTS_DIR="${PROJECTS_DIR:-$HOME/.local_ai}"
+DB_HASH="$AI_HOME/cli.sqlite"
+PATCH_FILE="$AI_HOME/project-fixes.patch"
+SUMMARY_FILE="$AI_HOME/summary.json"
+OLLAMA_BIN="$(command -v ollama || true)"
+MAX_ITERATIONS=10
+AGENT_MODEL="${AGENT_MODEL:-code}"
+
+mkdir -p "$AI_HOME" "$PROJECTS_DIR"
+
+log() { printf "[%s] %s\n" "$(date '+%T')" "$*"; }
+
+# --- Helpers ---
+ensure_ollama() { [[ -z "$OLLAMA_BIN" ]] && log "Ollama CLI not found" && exit 1; }
+is_url() { [[ "$1" =~ ^https?:// ]]; }
+is_file() { [[ -f "$1" ]]; }
+is_dir() { [[ -d "$1" ]]; }
+
+run_model_streaming() {
+    local model="$1" prompt="$2"
+    ensure_ollama
+    local tmp
+    tmp=$(mktemp)
+    stdbuf -o0 "$OLLAMA_BIN" run "$model" "$prompt" | tee /dev/tty >"$tmp" || true
+    cat "$tmp"
+}
+
+sha256_file() { sha256sum "$1" | awk '{print $1}'; }
+
+hash_file() {
+    local f="$1" h
+    [[ -f "$f" ]] || return
+    h=$(sha256_file "$f")
+    sqlite3 "$DB_HASH" "INSERT INTO file_hashes(path,hash,status,updated_at) VALUES('$f','$h','hash',CURRENT_TIMESTAMP) ON CONFLICT(path) DO UPDATE SET hash=excluded.hash,updated_at=excluded.updated_at;"
+}
+
+append_patch() { local f="$1" tmp="$2"; git diff --no-index --patch "$f" "$tmp" >> "$PATCH_FILE" || true; }
+
+resolve_ref_to_abs() { local base="$1" ref="$2"; [[ "$ref" == /* ]] && echo "$ref" || echo "$base/$ref"; }
+extract_refs_from_file() { grep -Eo '(src|href|include|require|import)[[:space:]]*[:=]?[[:space:]]*["'"'"'][^"'"'"']+["'"'"']' "$1" 2>/dev/null | sed -E "s/.*['\"]([^'\"]+)['\"].*/\1/" || true; }
+follow_refs() {
+    local start="$1" visited="$(mktemp)" ref absref
+    trap 'rm -f "$visited"' EXIT
+    find "$start" -type f -print0 | while IFS= read -r -d '' f; do echo "$f" >> "$visited"; done
+    local idx=1
+    while true; do
+        local total=$(wc -l < "$visited")
+        [[ $idx -gt $total ]] && break
+        local current
+        current=$(sed -n "${idx}p" "$visited")
+        idx=$((idx+1))
+        while IFS= read -r ref; do
+            absref=$(resolve_ref_to_abs "$(dirname "$current")" "$ref")
+            [[ -f "$absref" ]] || continue
+            grep -qxF "$absref" "$visited" || echo "$absref" >> "$visited"
+        done < <(extract_refs_from_file "$current")
+    done
+    cat "$visited"
+}
+
+# --- Agent ---
+run_ai_on_file() {
+    local file="$1"
+    local iter=0
+    local changed=1
+    local applied_count=0
+    while [[ $iter -lt $MAX_ITERATIONS && $changed -eq 1 ]]; do
+        iter=$((iter+1))
+        changed=0
+        local code fixed_code
+        code=$(cat "$file")
+        local ai_prompt="Analyze and fix file. Wrap full replacement in [FIX]...[/FIX]:
+<<<FILE_START>>>
+$code
+<<<FILE_END>>>"
+        local ai_response
+        ai_response=$(run_model_streaming "$AGENT_MODEL" "$ai_prompt")
+        fixed_code=$(echo "$ai_response" | awk '/^\[FIX\]/{f=1;next}/^\[\/FIX\]/{f=0} f')
+        fixed_code=$(printf "%s" "$fixed_code" | sed -e :a -e '/^\n*$/{$d;N;ba}')
+        if [[ -n "$fixed_code" ]]; then
+            if ! diff -u <(echo "$code") <(echo "$fixed_code") >/dev/null 2>&1; then
+                local tmp
+                tmp=$(mktemp)
+                echo "$fixed_code" > "$tmp"
+                append_patch "$file" "$tmp"
+                cp -a "$file" "${file}.bak.$$"
+                echo "$fixed_code" > "$file"
+                changed=1
+                applied_count=$((applied_count+1))
+                hash_file "$file"
+            fi
+        fi
+    done
+    echo "{\"file\":\"$file\",\"iterations\":$iter,\"fixes_applied\":$applied_count}"
+}
+
+run_ai_on_path() {
+    local path="$1"
+    local files
+    files=$(follow_refs "$path")
+    local summary="["
+    while IFS= read -r f; do
+        local file_summary
+        file_summary=$(run_ai_on_file "$f")
+        summary+="$file_summary,"
+    done <<< "$files"
+    summary="${summary%,}]"
+    echo "$summary" > "$SUMMARY_FILE"
+}
+
+run_ai_prompt() {
+    local prompt="$1"
+    run_model_streaming "$AGENT_MODEL" "$prompt"
+}
+
+# --- Universal dispatcher ---
+universal_cli() {
+    local input="$1"
+    if is_url "$input"; then
+        local tmp
+        tmp=$(mktemp)
+        curl -sL "$input" -o "$tmp"
+        run_ai_on_file "$tmp"
+        rm -f "$tmp"
+    elif is_file "$input"; then
+        run_ai_on_file "$input"
+    elif is_dir "$input"; then
+        run_ai_on_path "$input"
+    else
+        run_ai_prompt "$input"
+    fi
+}
+
+# --- Entry ---
+> "$PATCH_FILE"
+[[ $# -eq 0 ]] && echo "Usage: $0 <file|dir|url|prompt>" && exit 0
+
+for arg in "$@"; do
+    universal_cli "$arg"
+done
+
+log "All inputs processed. Patch: $PATCH_FILE, Summary: $SUMMARY_FILE"

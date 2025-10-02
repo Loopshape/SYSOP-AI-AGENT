@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# mega_ai_cli_parallel.sh - Low-memory multi-model AI CLI with parallelized token streaming
+
+set -euo pipefail
+IFS=$'\n\t'
+
+AI_HOME="${AI_HOME:-$HOME/.ai_agent}"
+PROJECTS_DIR="${PROJECTS_DIR:-$HOME/.local_ai}"
+DB_HASH="$AI_HOME/cli.sqlite"
+PATCH_FILE="$AI_HOME/project-fixes.patch"
+SUMMARY_FILE="$AI_HOME/summary.json"
+WORKSPACE="$PROJECTS_DIR/workspace_$(date +%s)"
+OLLAMA_BIN="$(command -v ollama || true)"
+MAX_ITERATIONS=8   # Lowered for low RAM
+AGENT_MODELS=("core" "2244" "loop" "code" "coin")
+GIT_BRANCH="${GIT_BRANCH:-ai-fixes}"
+AUTO_PUSH="${AUTO_PUSH:-0}"
+
+mkdir -p "$AI_HOME" "$PROJECTS_DIR" "$WORKSPACE"
+
+log() { printf "[%s] %s\n" "$(date '+%T')" "$*"; }
+log_warn() { printf "[WARN][%s] %s\n" "$(date '+%T')" "$*"; }
+
+ensure_ollama() { [[ -z "$OLLAMA_BIN" ]] && log "Ollama CLI not found" && exit 1; }
+
+sqlite_escape() { echo "$1" | sed "s/'/''/g"; }
+sha256_file() { sha256sum "$1" | awk '{print $1}'; }
+hash_file() { local f="$1"; [[ -f "$f" ]] || return; local h; h=$(sha256_file "$f"); sqlite3 "$DB_HASH" "INSERT INTO file_hashes(path,hash,status,updated_at) VALUES('$f','$h','hash',CURRENT_TIMESTAMP) ON CONFLICT(path) DO UPDATE SET hash=excluded.hash,updated_at=excluded.updated_at;"; }
+get_prev_hash() { sqlite3 "$DB_HASH" "SELECT hash FROM file_hashes WHERE path='$(sqlite_escape "$1")';" 2>/dev/null || echo ""; }
+
+resolve_ref_to_abs() { local base="$1" ref="$2"; [[ "$ref" == /* ]] && echo "$ref" || echo "$base/$ref"; }
+extract_refs_from_file() { grep -Eo '(src|href|include|require|import)[[:space:]]*[:=]?[[:space:]]*["'"'"'][^"'"'"']+["'"'"']' "$1" 2>/dev/null | sed -E "s/.*['\"]([^'\"]+)['\"].*/\1/" || true; }
+
+# --- Dependency Resolution ---
+follow_refs() {
+    local start="$1" visited="$(mktemp)" ref absref
+    trap 'rm -f "$visited"' EXIT
+    find "$start" -type f -print0 | while IFS= read -r -d '' f; do echo "$f" >> "$visited"; done
+    local idx=1
+    while true; do
+        local total=$(wc -l < "$visited")
+        [[ $idx -gt $total ]] && break
+        local current=$(sed -n "${idx}p" "$visited")
+        idx=$((idx+1))
+        while IFS= read -r ref; do
+            absref=$(resolve_ref_to_abs "$(dirname "$current")" "$ref")
+            [[ -f "$absref" ]] || continue
+            grep -qxF "$absref" "$visited" || echo "$absref" >> "$visited"
+        done < <(extract_refs_from_file "$current")
+    done
+    cat "$visited"
+}
+
+build_dep_graph() {
+    local path="$1"
+    declare -A dep_graph
+    for f in $(follow_refs "$path"); do
+        dep_graph["$f"]="$(extract_refs_from_file "$f")"
+    done
+    echo "$(declare -p dep_graph)"
+}
+
+topo_sort() {
+    declare -n graph=$1
+    local sorted=() visited=()
+    local visit
+    visit() {
+        local node="$1"
+        [[ ${visited[$node]+_} ]] && return
+        visited[$node]=1
+        for dep in ${graph[$node]}; do visit "$dep"; done
+        sorted+=("$node")
+    }
+    for node in "${!graph[@]}"; do visit "$node"; done
+    echo "${sorted[@]}"
+}
+
+# --- AI Agent ---
+run_model_streaming() {
+    local model="$1" prompt="$2"
+    ensure_ollama
+    stdbuf -o0 "$OLLAMA_BIN" run "$model" "$prompt"
+}
+
+select_model_for_file() {
+    local file="$1"
+    case "$file" in
+        *.sh|*.py|*.c|*.cpp) echo "code" ;;
+        *.json|*.yaml|*.toml) echo "core" ;;
+        *.md|*.txt) echo "2244" ;;
+        *.cfg|*.ini) echo "loop" ;;
+        *.coin) echo "coin" ;;
+        *) echo "core" ;;
+    esac
+}
+
+run_ai_on_file() {
+    local file="$1"
+    local prev_hash=$(get_prev_hash "$file")
+    local iter=0 changed=1 applied_count=0
+    local model=$(select_model_for_file "$file")
+
+    while [[ $iter -lt $MAX_ITERATIONS && $changed -eq 1 ]]; do
+        iter=$((iter+1))
+        changed=0
+        local code fixed_code
+        code=$(cat "$file")
+        local ai_prompt="Analyze and fix file using model $model. Wrap replacement in [FIX]...[/FIX]:
+<<<FILE_START>>>
+$code
+<<<FILE_END>>>"
+        local ai_response=$(run_model_streaming "$model" "$ai_prompt")
+        fixed_code=$(echo "$ai_response" | awk '/^\[FIX\]/{f=1;next}/^\[\/FIX\]/{f=0} f')
+        if [[ -n "$fixed_code" ]] && ! diff -u <(echo "$code") <(echo "$fixed_code") >/dev/null 2>&1; then
+            local tmp=$(mktemp)
+            echo "$fixed_code" > "$tmp"
+            git diff --no-index "$file" "$tmp" || true
+            cp -a "$file" "${file}.bak.$$"
+            echo "$fixed_code" > "$file"
+            changed=1
+            applied_count=$((applied_count+1))
+            hash_file "$file"
+        fi
+    done
+    local new_hash=$(sha256_file "$file")
+    [[ "$prev_hash" == "$new_hash" ]] && echo "" || echo "{\"file\":\"$file\",\"iterations\":$iter,\"model\":\"$model\",\"fixes_applied\":$applied_count}"
+}
+
+run_ai_on_path_parallel() {
+    local path="$1"
+    eval "$(build_dep_graph "$path")"
+    local sorted_files=($(topo_sort dep_graph))
+    local summary="["
+    for f in "${sorted_files[@]}"; do
+        run_ai_on_file "$f" &
+    done
+    wait  # Parallel execution
+    for f in "${sorted_files[@]}"; do
+        local fs=$(run_ai_on_file "$f")
+        [[ -n "$fs" ]] && summary+="$fs,"
+    done
+    summary="${summary%,}]"
+    echo "$summary" > "$SUMMARY_FILE"
+}
+
+# --- Multi-URL fetch ---
+fetch_urls_to_workspace() {
+    local urls_file="$1"
+    while IFS= read -r url; do
+        [[ -z "$url" || "$url" =~ ^# ]] && continue
+        local fname=$(basename "$url")
+        curl -sL "$url" -o "$WORKSPACE/$fname"
+        log "Fetched $url -> $WORKSPACE/$fname"
+    done < "$urls_file"
+}
+
+universal_cli() {
+    local input="$1"
+    if [[ "$input" =~ ^https?:// ]]; then
+        local tmp=$(mktemp)
+        curl -sL "$input" -o "$tmp"
+        run_ai_on_file "$tmp"
+        rm -f "$tmp"
+    elif [[ -f "$input" ]]; then
+        run_ai_on_file "$input"
+    elif [[ -d "$input" ]]; then
+        for f in "$input"/*; do
+            [[ "$f" =~ ^https?:// ]] && fetch_urls_to_workspace "$f"
+        done
+        run_ai_on_path_parallel "$WORKSPACE"
+    else
+        run_model_streaming "core" "$input"
+    fi
+}
+
+# --- Git: hierarchical incremental commits ---
+git_commit_incremental() {
+    cd "$WORKSPACE"
+    git checkout -B "$GIT_BRANCH" || git checkout -b "$GIT_BRANCH"
+    local changed_files folder
+    changed_files=$(git ls-files -m)
+    declare -A folders
+    for f in $changed_files; do
+        folder=$(dirname "$f")
+        folders["$folder"]+="$f "
+    done
+    for folder in "${!folders[@]}"; do
+        git add ${folders[$folder]}
+        local ai_summary=$(run_model_streaming "core" "Generate concise commit message for folder $folder:\nFiles: ${folders[$folder]}")
+        git commit -m "$ai_summary"
+    done
+    [[ "$AUTO_PUSH" -eq 1 ]] && git push -u origin "$GIT_BRANCH"
+}
+
+# --- Entry ---
+> "$PATCH_FILE"
+[[ $# -eq 0 ]] && echo "Usage: $0 <file|dir|url|prompt> [--push]" && exit 0
+[[ " $* " == *"--push"* ]] && AUTO_PUSH=1
+
+for arg in "$@"; do
+    [[ "$arg" == "--push" ]] && continue
+    universal_cli "$arg"
+done
+
+git_commit_incremental
+log "All done. Patch: $PATCH_FILE, Summary: $SUMMARY_FILE"

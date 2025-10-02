@@ -1,0 +1,189 @@
+#!/usr/bin/env bash
+# mega_ai_cli_universal_v1.sh - Universal AI + DevOps CLI
+# Auto-detects input type: file | dir | URL | AI prompt | CLI param
+# Iterative analyze → fix → apply → re-analyze loop included
+
+set -euo pipefail
+IFS=$'\n\t'
+trap 'echo -e "\033[31m[ERROR] Script failed at line $LINENO\033[0m"' ERR INT
+
+# --- CONFIG ---
+AI_HOME="${AI_HOME:-$HOME/.ai_agent}"
+PROJECTS_DIR="${PROJECTS_DIR:-$HOME/.local_ai}"
+MEMORY_DB="$AI_HOME/memory.db"
+DB_HASH="$AI_HOME/cli.sqlite"
+SNAPSHOT_DIR="$AI_HOME/snapshots"
+OLLAMA_BIN="$(command -v ollama || true)"
+MAX_ITERATIONS=10
+AUTO_APPROVE=0
+DEFAULT_AGENT_MODEL="code"
+AGENT_MODEL="${AGENT_MODEL:-$DEFAULT_AGENT_MODEL}"
+
+mkdir -p "$AI_HOME" "$PROJECTS_DIR" "$SNAPSHOT_DIR"
+
+# --- Logging ---
+log() { printf "[%s] %s\n" "$(date '+%T')" "$*"; }
+log_success() { log "[SUCCESS] $*"; }
+log_warn() { log "[WARN] $*"; }
+log_error() { log "[ERROR] $*"; exit 1; }
+
+# --- Utilities ---
+is_url() { [[ "$1" =~ ^https?:// ]]; }
+is_file() { [[ -f "$1" ]]; }
+is_dir() { [[ -d "$1" ]]; }
+gen_task_id() { echo -n "$1$(date +%s%N)$RANDOM" | sha256sum | cut -c1-16; }
+
+# --- Ollama helper ---
+ensure_ollama() { [[ -z "$OLLAMA_BIN" ]] && log_error "Ollama CLI not found"; }
+
+run_model_streaming() {
+    local model="$1" prompt="$2"
+    ensure_ollama
+    log "Streaming AI model ($model)..."
+    local tmp
+    tmp=$(mktemp)
+    trap 'rm -f "$tmp"' RETURN
+    stdbuf -o0 "$OLLAMA_BIN" run "$model" "$prompt" | tee /dev/tty >"$tmp" || true
+    cat "$tmp"
+}
+
+# --- Hashing ---
+sha256_file() { sha256sum "$1" | awk '{print $1}'; }
+hash_file() {
+    local f="$1" h old event_type
+    [[ -f "$f" ]] || return
+    h=$(sha256_file "$f")
+    old=$(sqlite3 "$DB_HASH" "SELECT hash FROM file_hashes WHERE path='$f';")
+    event_type="hash"
+    [[ -n "$old" && "$old" != "$h" ]] && event_type="rehash"
+    sqlite3 "$DB_HASH" "INSERT INTO file_hashes(path,hash,status,updated_at) VALUES('$f','$h','${event_type}d',CURRENT_TIMESTAMP) ON CONFLICT(path) DO UPDATE SET hash=excluded.hash,status=excluded.status,updated_at=excluded.updated_at;"
+    log "$event_type: $f -> $h"
+}
+
+hash_files_verbose() { while IFS= read -r f; do hash_file "$f"; done < <(find "${1:-.}" -type f); }
+
+# --- File Parsing ---
+resolve_ref_to_abs() { local base="$1" ref="$2"; [[ "$ref" == /* ]] && echo "$ref" || echo "$base/$ref"; }
+extract_refs_from_file() {
+    grep -Eo '(src|href|include|require|import)[[:space:]]*[:=]?[[:space:]]*["'"'"'][^"'"'"']+["'"'"']' "$1" 2>/dev/null \
+        | sed -E "s/.*['\"]([^'\"]+)['\"].*/\1/" || true
+}
+follow_refs() {
+    local start="$1" visited="$(mktemp)" ref absref
+    trap 'rm -f "$visited"' EXIT
+    find "$start" -type f -print0 | while IFS= read -r -d '' f; do echo "$f" >> "$visited"; done
+    local idx=1
+    while true; do
+        local total=$(wc -l < "$visited")
+        [[ $idx -gt $total ]] && break
+        local current
+        current=$(sed -n "${idx}p" "$visited")
+        idx=$((idx+1))
+        while IFS= read -r ref; do
+            absref=$(resolve_ref_to_abs "$(dirname "$current")" "$ref")
+            [[ -f "$absref" ]] || continue
+            grep -qxF "$absref" "$visited" || echo "$absref" >> "$visited"
+        done < <(extract_refs_from_file "$current")
+    done
+    cat "$visited"
+}
+
+# --- Confirm ---
+confirm_action() {
+    [[ "$AUTO_APPROVE" -eq 1 ]] && return 0
+    read -p "$1 [y/N]? " c; [[ "$c" =~ ^[Yy]$ ]]
+}
+
+# --- Agent: iterative reloop ---
+run_ai_on_file() {
+    local file="$1"
+    local iter=0
+    local changed=1
+    while [[ $iter -lt $MAX_ITERATIONS && $changed -eq 1 ]]; do
+        iter=$((iter+1))
+        changed=0
+        local code
+        code=$(cat "$file")
+        local ai_prompt="Analyze and suggest fixes (if any) for the file. Wrap full replacement in [FIX]...[/FIX]:
+<<<FILE_START>>>
+$code
+<<<FILE_END>>>"
+        local ai_response
+        ai_response=$(run_model_streaming "$AGENT_MODEL" "$ai_prompt")
+        local fixed_code
+        fixed_code=$(echo "$ai_response" | awk '/^\[FIX\]/{f=1;next}/^\[\/FIX\]/{f=0} f')
+        fixed_code=$(printf "%s" "$fixed_code" | sed -e :a -e '/^\n*$/{$d;N;ba}')
+        if [[ -n "$fixed_code" ]]; then
+            if ! diff -u <(echo "$code") <(echo "$fixed_code") >/dev/null 2>&1; then
+                if confirm_action "Apply fix to $file?"; then
+                    cp -a "$file" "${file}.bak.$$"
+                    echo "$fixed_code" > "$file"
+                    hash_file "$file"
+                    changed=1
+                fi
+            fi
+        fi
+    done
+}
+
+run_ai_on_path() {
+    local path="$1"
+    local files
+    files=$(follow_refs "$path")
+    hash_files_verbose "$path"
+    while IFS= read -r f; do
+        run_ai_on_file "$f"
+    done <<< "$files"
+}
+
+run_ai_prompt() {
+    local prompt="$1"
+    run_model_streaming "$AGENT_MODEL" "$prompt"
+}
+
+# --- Universal dispatcher ---
+universal_cli() {
+    local input="$1"
+    if is_url "$input"; then
+        log "Detected URL: $input"
+        local tmp
+        tmp=$(mktemp)
+        curl -sL "$input" -o "$tmp"
+        run_ai_on_file "$tmp"
+        rm -f "$tmp"
+    elif is_file "$input"; then
+        log "Detected file: $input"
+        run_ai_on_file "$input"
+    elif is_dir "$input"; then
+        log "Detected directory: $input"
+        run_ai_on_path "$input"
+    elif [[ "$input" =~ ^-- ]]; then
+        case "$input" in
+            --auto|-y) AUTO_APPROVE=1; log "Auto-approve enabled";;
+            --help|-h) show_help; exit 0;;
+            *) log_warn "Unknown parameter $input";;
+        esac
+    else
+        log "Detected AI prompt"
+        run_ai_prompt "$input"
+    fi
+}
+
+show_help() {
+    cat <<EOF
+Usage: mega_ai_cli_universal.sh [input]...
+
+Input can be:
+  - File path       : ./file.txt
+  - Directory path  : ./project_dir
+  - URL             : https://example.com/code
+  - AI prompt       : "Refactor this code..."
+  - CLI parameter   : --auto, -y, --help, -h
+EOF
+}
+
+# --- Entry ---
+[[ $# -eq 0 ]] && { show_help; exit 0; }
+for arg in "$@"; do
+    universal_cli "$arg"
+done

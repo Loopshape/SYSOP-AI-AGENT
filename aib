@@ -1,0 +1,177 @@
+#!/usr/bin/env zsh
+# mex - AI DevOps & Builder Shell v1.0
+# Features: triad AI (Messenger, Combinator, Trader), live verbose output, dual pools, screen support
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# -------------------
+# DIRECTORIES / POOLS
+# -------------------
+AI_AGENT_HOME="${AI_AGENT_HOME:-$HOME/.ai-agent}"     # Persistent pool (memories/config)
+AI_BUILDER_HOME="${AI_BUILDER_HOME:-$HOME/.ai_builder}"  # Workspaces / builds
+
+mkdir -p "$AI_AGENT_HOME" "$AI_BUILDER_HOME/projects"
+
+MEMORY_DB="$AI_AGENT_HOME/memory.db"
+CONFIG_DB="$AI_AGENT_HOME/config.db"
+PROJECTS_DIR="$AI_BUILDER_HOME/projects"
+
+# -------------------
+# MODELS
+# -------------------
+DEFAULT_MESSENGER_MODEL="gemma3:1b"
+DEFAULT_COMBINATOR_MODEL="deepseek-r1:1.5b"
+DEFAULT_TRADER_MODEL="2244-1"
+
+MESSENGER_MODEL=""
+COMBINATOR_MODEL=""
+TRADER_MODEL=""
+
+OLLAMA_BIN="$(command -v ollama || true)"
+
+# -------------------
+# COLORS / LOGGING
+# -------------------
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; PURPLE='\033[0;35m'; CYAN='\033[0;36m'; NC='\033[0m'
+
+log() { printf "${BLUE}[%s]${NC} %s\n" "$(date '+%T')" "$*"; }
+log_success() { log "${GREEN}$*${NC}"; }
+log_warn() { log "${YELLOW}WARN: $*${NC}"; }
+log_error() { log "${RED}ERROR: $*${NC}"; exit 1; }
+log_info() { log "${CYAN}$*${NC}"; }
+log_phase() { echo -e "\n${PURPLE}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}"; log "${PURPLE}$*${NC}"; echo -e "${PURPLE}▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓${NC}"; }
+
+# -------------------
+# DATABASE
+# -------------------
+sqlite_escape() { echo "$1" | sed "s/'/''/g"; }
+init_db() {
+    sqlite3 "$MEMORY_DB" "CREATE TABLE IF NOT EXISTS memories (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, prompt TEXT, response TEXT, task_id TEXT);" 2>/dev/null || true
+    sqlite3 "$CONFIG_DB" "CREATE TABLE IF NOT EXISTS config (key TEXT PRIMARY KEY, value TEXT);" 2>/dev/null || true
+}
+
+set_config() { sqlite3 "$CONFIG_DB" "INSERT OR REPLACE INTO config (key,value) VALUES ('$(sqlite_escape "$1")','$(sqlite_escape "$2")');" ; log_success "Config set: $1 = $2"; }
+get_config() { sqlite3 "$CONFIG_DB" "SELECT value FROM config WHERE key='$(sqlite_escape "$1")';" 2>/dev/null; }
+load_config_values() {
+    MESSENGER_MODEL="$(get_config messenger_model || echo "$DEFAULT_MESSENGER_MODEL")"
+    COMBINATOR_MODEL="$(get_config combinator_model || echo "$DEFAULT_COMBINATOR_MODEL")"
+    TRADER_MODEL="$(get_config trader_model || echo "$DEFAULT_TRADER_MODEL")"
+}
+
+add_to_memory() { sqlite3 "$MEMORY_DB" "INSERT INTO memories (prompt,response,task_id) VALUES ('$(sqlite_escape "$1")','$(sqlite_escape "$2")','$3');" 2>/dev/null; }
+search_memory() { sqlite3 -header -column "$MEMORY_DB" "SELECT timestamp,prompt,response FROM memories WHERE prompt LIKE '%$(sqlite_escape "$1")%' ORDER BY timestamp DESC LIMIT 5;" 2>/dev/null; }
+
+# -------------------
+# UTILS
+# -------------------
+gen_task_id() { echo -n "$1$(date +%s%N)$RANDOM${AI_SEED:-}" | sha256sum | cut -c1-16; }
+confirm_action() { echo -e "${YELLOW}CONFIRM: $1${NC}"; read -r "r?Type 'yes' to confirm: "; [[ "$r" == "yes" ]]; }
+tool_read_file() { [[ -f "$1" ]] && cat "$1" || echo "ERROR: File not found: $1"; }
+tool_list_directory() { [[ -d "${1:-.}" ]] && tree -L 2 "$1" || echo "ERROR: Directory not found: $1"; }
+tool_web_search() { confirm_action "Search web for: $1" && curl -sL "https://html.duckduckgo.com/html/?q=$(jq -nr --arg q "$1" '$q|@uri')" | lynx -dump -stdin -nolist || echo "ACTION CANCELED"; }
+tool_write_file() { confirm_action "Write to file: $1" && mkdir -p "$(dirname "$1")" && echo -e "$2" > "$1" && echo "SUCCESS: File written." || echo "ACTION CANCELED"; }
+
+# -------------------
+# AI WORKER
+# -------------------
+ensure_ollama_server() { pgrep -f "ollama serve" >/dev/null || { log "Ollama server starting..."; nohup "$OLLAMA_BIN" serve >/dev/null 2>&1 & sleep 3; }; }
+
+run_worker_raw() {
+    local model="$1" system_prompt="$2" conversation_history="$3"
+    ensure_ollama_server
+
+    local temperature="$(get_config temperature || echo "0.7")"
+    local top_p="$(get_config top_p || echo "0.9")"
+    local seed="$(get_config seed || echo "")"
+
+    local fifo_path=$(mktemp -u)
+    mkfifo "$fifo_path"
+    local response_buffer=""
+
+    # Start Ollama process in background streaming everything
+    (
+        "$OLLAMA_BIN" run --verbose "$model" --temperature "$temperature" --top-p "$top_p" ${seed:+--seed "$seed"} "$system_prompt\n$conversation_history" 2>&1 > "$fifo_path"
+    ) &
+    local ollama_pid=$!
+
+    while IFS= read -r line < "$fifo_path"; do
+        [[ -z "$line" ]] && continue
+        if [[ "$line" =~ ^\>\>\> ]]; then
+            echo -e "${YELLOW}$line${NC}"
+        elif [[ "$line" =~ ^\{.*\}$ ]]; then
+            local response_token=$(echo "$line" | jq -r '.response? // empty' 2>/dev/null)
+            local done_status=$(echo "$line" | jq -r '.done? // false' 2>/dev/null)
+            [[ -n "$response_token" ]] && { printf '%s' "$response_token"; response_buffer+="$response_token"; }
+            [[ "$done_status" == "true" ]] && printf '\n'
+        else
+            echo -e "${BLUE}$line${NC}"
+        fi
+    done
+
+    wait "$ollama_pid" 2>/dev/null || true
+    rm -f "$fifo_path"
+    echo "$response_buffer"
+}
+
+# -------------------
+# TRIUMVIRATE AGENT
+# -------------------
+run_triumvirate_agent() {
+    local user_prompt="$*"
+    log_phase "PHASE 0: SETUP & PROJECTION"
+    local task_id=$(gen_task_id "$user_prompt")
+    local task_dir="$PROJECTS_DIR/$task_id"
+    mkdir -p "$task_dir"
+    log_success "Task ID: $task_id | Workspace: $task_dir"
+
+    local relevant_memories=$(search_memory "$user_prompt")
+
+    log_phase "PHASE 1: ASYNC BRAINSTORMING"
+    local messenger_prompt="You are MESSENGER, gather info. TOOLS: list_directory, web_search, read_file\nUser Request: $user_prompt"
+    local combinator_prompt="You are COMBINATOR, brainstorm plans. TOOLS: write_file\nUser Request: $user_prompt"
+
+    run_worker_raw "$MESSENGER_MODEL" "$messenger_prompt" "$relevant_memories" > "$task_dir/messenger.log" 2>&1 &
+    local messenger_pid=$!
+    run_worker_raw "$COMBINATOR_MODEL" "$combinator_prompt" "$relevant_memories" > "$task_dir/combinator.log" 2>&1 &
+    local combinator_pid=$!
+
+    # Spinner
+    local spinner='/-\|'
+    printf "${CYAN}Brainstorming... ${NC}"
+    local i=0
+    while kill -0 "$messenger_pid" 2>/dev/null || kill -0 "$combinator_pid" 2>/dev/null; do
+        printf "\b%s" "${spinner:i++%${#spinner}:1}"
+        sleep 0.1
+    done
+    printf "\b Done.\n"
+
+    local messenger_response=$(<"$task_dir/messenger.log")
+    local combinator_response=$(<"$task_dir/combinator.log")
+
+    log_phase "PHASE 2: SYNTHESIS & EXECUTION (TRADER)"
+    local trader_prompt="You are TRADER. Merge Messenger & Combinator info. Present [FINAL_ANSWER] tag.\n--- MESSENGER ---\n$messenger_response\n--- COMBINATOR ---\n$combinator_response\n--- FINAL RESPONSE ---"
+    local trader_response=$(run_worker_raw "$TRADER_MODEL" "$trader_prompt" "$relevant_memories")
+
+    log_phase "PHASE 3: FINALIZATION"
+    if echo "$trader_response" | grep -q '\[FINAL_ANSWER\]'; then
+        log_success "Trader produced a FINAL_ANSWER"
+        add_to_memory "$user_prompt" "$trader_response" "$task_id"
+    else
+        log_warn "No [FINAL_ANSWER] produced."
+    fi
+}
+
+# -------------------
+# MAIN
+# -------------------
+init_db
+load_config_values
+
+if [[ $# -eq 0 ]]; then
+    echo "Usage: mex \"<your prompt>\""; exit 0
+fi
+
+# Auto-run agent
+run_triumvirate_agent "$@"

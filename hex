@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# AI Autonomic Synthesis Platform v35.0 (Mandatory ~/bin/ai)
+# Unified Task Manager + Trading + Streaming Core
+
+set -euo pipefail
+IFS=$'\n\t'
+
+# --- PATHS ---
+AI_HOME="${AI_HOME:-$HOME/.local_ai}"
+PROJECTS_DIR="$AI_HOME"
+LOG_DIR="$AI_HOME/logs"
+TMP_DIR="$AI_HOME/tmp"
+SWAP_DIR="$AI_HOME/swap"
+CORE_DB="$AI_HOME/agent_core.db"
+TASK_DB="$AI_HOME/ai_task_manager.db"
+LOG_FILE="$LOG_DIR/system.log"
+CONFIG_FILE="$AI_HOME/config"
+HMAC_SECRET_KEY="$AI_HOME/secret.key"
+
+# --- MODELS ---
+MESSENGER_MODEL="core"
+PLANNER_MODEL="loop"
+EXECUTOR_MODEL="2244-1"
+
+# --- AGENT PARAMS ---
+MAX_AGENT_LOOPS=12
+MAX_RAM_BYTES=2097152
+DEPENDENCIES=("git" "npm" "curl" "tar" "nano" "sqlite3" "openssl" "gpg" "node")
+
+# --- COLORS ---
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+ICON_SUCCESS="✅"; ICON_WARN="⚠️"; ICON_ERROR="❌"; ICON_INFO="ℹ️"; ICON_TRADE="💰"; ICON_TASK="📝"
+
+# --- LOGGING ---
+init_logging(){ mkdir -p "$LOG_DIR"; }
+log_msg(){ local lvl="$1" msg="$2"; echo -e "${lvl}$(date '+%T') $msg${NC}" | tee -a "$LOG_FILE" >&2; }
+log_info(){ log_msg "$BLUE[INFO] " "$*"; }
+log_warn(){ log_msg "$YELLOW[WARN] " "$*"; }
+log_error(){ log_msg "$RED[ERROR] " "$*"; }
+log_success(){ log_msg "$GREEN[SUCCESS] " "$*"; }
+
+# --- SQLITE ESCAPE ---
+sqlite_escape(){ echo "$1" | sed "s/'/''/g"; }
+
+# --- HASHING ---
+hash_string(){ echo -n "$1" | sha256sum | cut -d' ' -f1; }
+sha256_file(){ sha256sum "$1" | awk '{print $1}'; }
+
+# --- DATABASE INIT ---
+init_task_db(){
+    if [[ ! -f "$TASK_DB" ]]; then
+        log_info "Initializing task DB..."
+        sqlite3 "$TASK_DB" <<'SQL'
+CREATE TABLE projects (hash TEXT PRIMARY KEY, path TEXT, ts DATETIME DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE file_hashes (project_hash TEXT, file_path TEXT, file_hash TEXT, rehashed INTEGER DEFAULT 0, PRIMARY KEY(project_hash,file_path));
+CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts DATETIME DEFAULT CURRENT_TIMESTAMP, type TEXT, data TEXT);
+SQL
+    fi
+}
+init_core_db(){
+    if [[ ! -f "$CORE_DB" ]]; then
+        sqlite3 "$CORE_DB" <<'SQL'
+CREATE TABLE memories (id INTEGER PRIMARY KEY, prompt_hash TEXT, prompt TEXT, response_ref TEXT);
+CREATE TABLE tool_logs (id INTEGER PRIMARY KEY, task_id TEXT, tool_name TEXT, args TEXT, result TEXT);
+SQL
+    fi
+}
+
+# --- MEMORY CACHE ---
+add_to_memory(){ local prompt="$1" response="$2"; local phash; phash=$(hash_string "$prompt"); sqlite3 "$CORE_DB" "INSERT INTO memories(prompt_hash,prompt,response_ref) VALUES('$(sqlite_escape "$phash")','$(sqlite_escape "$prompt")','$(sqlite_escape "$response"));"; }
+get_from_memory(){ local prompt="$1"; local phash; phash=$(hash_string "$prompt"); sqlite3 "$CORE_DB" "SELECT response_ref FROM memories WHERE prompt_hash='$(sqlite_escape "$phash")' LIMIT 1;"; }
+
+# --- AI WORKERS (STREAMING ONLY) ---
+ensure_ollama(){ if ! curl -s http://localhost:11434/api/tags >/dev/null; then log_info "Starting Ollama..."; nohup ollama serve >/dev/null 2>&1 & sleep 3; fi; }
+run_worker_streaming(){ local model="$1" sys="$2" prompt="$3"; local resp=""; local payload; payload=$(jq -nc --arg m "$model" --arg s "$sys" --arg p "$prompt" '{model:$m,system:$s,prompt:$p,stream:true}'); while IFS= read -r line; do if jq -e . >/dev/null 2>&1 <<<"$line"; then local token; token=$(echo "$line"|jq -r '.response // empty'); [[ -n "$token" ]] && printf "%s" "$token" >&2 && resp+="$token"; fi; done < <(curl -s -X POST http://localhost:11434/api/generate -d "$payload"); printf "\n" >&2; echo "$resp"; }
+
+# --- TOOLS ---
+tool_run_command(){ (cd "$1" && eval "$2") 2>&1 || echo "Command failed"; }
+tool_write_file(){ mkdir -p "$(dirname "$1/$2")"; echo -e "$3" > "$1/$2"; echo "Wrote file: $2"; }
+tool_analyze_market(){ local asset="${2:-BTC/USD}"; log_info "Analyzing $asset"; ensure_ollama; run_worker_streaming "$EXECUTOR_MODEL" "Trader" "Provide structured crypto analysis for $asset"; }
+tool_launch_trading_ui(){ cd "$AI_HOME"; npm install; npm run dev & disown; log_success "Trading UI launched at http://localhost:3000"; }
+
+# --- TASKS ---
+ingest_repo(){ local repo="$1"; local hash; hash=$(echo -n "$repo"|sha256sum|awk '{print $1}'); sqlite3 "$TASK_DB" "INSERT OR IGNORE INTO projects(hash,path) VALUES('$hash','$(sqlite_escape "$repo")');"; find "$repo" -type f | while read -r f; do sqlite3 "$TASK_DB" "INSERT OR REPLACE INTO file_hashes(project_hash,file_path,file_hash) VALUES('$hash','$(sqlite_escape "$f")','$(sha256_file "$f")');"; done; log_success "Repo ingested: $repo"; }
+rehash_repo(){ local hash="$1"; local base; base=$(sqlite3 "$TASK_DB" "SELECT path FROM projects WHERE hash='$hash'"); [[ -z "$base" ]] && { log_error "No project path"; return 1; }; log_info "Rehashing $base"; find "$base" -type f | while read -r f; do local newh=$(sha256_file "$f"); local oldh=$(sqlite3 "$TASK_DB" "SELECT file_hash FROM file_hashes WHERE project_hash='$hash' AND file_path='$(sqlite_escape "$f")'"); if [[ "$newh" != "$oldh" ]]; then sqlite3 "$TASK_DB" "UPDATE file_hashes SET file_hash='$newh' WHERE project_hash='$hash' AND file_path='$(sqlite_escape "$f")'"; log_info "Updated: $f"; fi; done; log_success "Rehash complete"; }
+
+qbit_task(){ local args="$*"; sqlite3 "$TASK_DB" "INSERT INTO events(type,data) VALUES('qbit','$(sqlite_escape "$args")');"; log_success "QBit task logged: $args"; }
+
+# --- AGI WORKFLOW ---
+run_agi_workflow(){
+    local user_prompt="$*"; local task_id; task_id=$(hash_string "$user_prompt$(date +%s%N)"|cut -c1-16)
+    local project_dir="$PROJECTS_DIR/task-$task_id"; mkdir -p "$project_dir"
+    log_success "Workspace: $project_dir (Task $task_id)"
+
+    local cached; cached=$(get_from_memory "$user_prompt" || true)
+    local conversation_history="User Request: $user_prompt"
+    [[ -n "$cached" ]] && conversation_history+="\n\n--- Cached Knowledge ---\n$cached"
+
+    for ((i=1;i<=MAX_AGENT_LOOPS;i++)); do
+        log_info "AGI Loop $i/$MAX_AGENT_LOOPS"
+        local messenger; messenger=$(run_worker_streaming "$MESSENGER_MODEL" "Messenger" "$conversation_history")
+        local exec_ctx="You are Executor. Choose a tool or give final.\n---\n$messenger"
+        local plan; plan=$(run_worker_streaming "$EXECUTOR_MODEL" "Executor" "$exec_ctx")
+
+        if [[ "$plan" == *"[FINAL_ANSWER]"* ]]; then
+            local ans; ans=$(echo "$plan"|sed 's/.*FINAL_ANSWER //')
+            echo -e "\n${GREEN}--- Final Result ---${NC}\n$ans"
+            add_to_memory "$user_prompt" "$ans"
+            return
+        fi
+
+        # Execute tool automatically if mentioned
+        if [[ "$plan" == *"[TOOL]"* ]]; then
+            local tool_line; tool_line=$(echo "$plan" | grep 'TOOL' | head -n1)
+            local clean_tool_cmd="${tool_line#TOOL }"
+            local tool_name=$(echo "$clean_tool_cmd" | awk '{print $1}')
+            local args_str=$(echo "$clean_tool_cmd" | cut -d' ' -f2-)
+            local tool_args=(); eval "tool_args=($args_str)"
+            local result="Tool failed"
+            if declare -f "tool_$tool_name" > /dev/null; then
+                result=$(tool_"$tool_name" "$project_dir" "${tool_args[@]}" 2>&1 || echo "Tool error: $tool_name")
+            fi
+            sqlite3 "$CORE_DB" "INSERT INTO tool_logs (task_id, tool_name, args, result) VALUES ('$task_id', '$tool_name', '$(sqlite_escape "$args_str")', '$(sqlite_escape "$result")');"
+            conversation_history="Loop $i: $result"
+        else
+            conversation_history="Loop $i: $plan"
+        fi
+    done
+    log_warn "No final answer produced."
+}
+
+# --- INIT ---
+init_environment(){ mkdir -p "$AI_HOME" "$PROJECTS_DIR" "$LOG_DIR" "$TMP_DIR" "$SWAP_DIR"; init_task_db; init_core_db; [[ ! -f "$HMAC_SECRET_KEY" ]] && openssl rand -hex 32 > "$HMAC_SECRET_KEY"; chmod 600 "$HMAC_SECRET_KEY"; }
+
+# --- MAIN ---
+main(){
+    init_logging; init_environment
+    local cmd="${1:-}"
+    case "$cmd" in
+        ingest) shift; ingest_repo "$@" ;;
+        rehash) shift; rehash_repo "$@" ;;
+        task|ai) shift; run_agi_workflow "$@" ;;
+        qbit) shift; qbit_task "$@" ;;
+        trade) shift; tool_analyze_market "$PROJECTS_DIR/analysis" "$@" ;;
+        launch-ui) tool_launch_trading_ui ;;
+        status) log_info "Core: $CORE_DB | Tasks: $TASK_DB" ;;
+        *) run_agi_workflow "$@" ;;
+    esac
+}
+
+main "$@"

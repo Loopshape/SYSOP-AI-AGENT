@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+# ~/bin/ai.sh
+# Offline, redundant, hash-indexed CLI with qbit DSL -> ai_data pipeline
+set -euo pipefail
+
+# ------------------------
+# Config
+# ------------------------
+DB="${DB:-$HOME/.cli_db.sqlite}"
+VERBOSE=${VERBOSE:-1}
+DRY_RUN=${DRY_RUN:-0}
+CLI_NAME="$(basename "$0")"
+
+# ------------------------
+# Utilities
+# ------------------------
+log() {
+  local lvl="$1"; shift
+  [[ $VERBOSE -ge $lvl ]] && printf '[%s] %s\n' "$(date +'%Y-%m-%d %H:%M:%S')" "$*"
+}
+error() {
+  printf '[ERROR] %s\n' "$*" >&2
+}
+die() { error "$*"; exit 1; }
+
+# Escape single-quote for sqlite string literal
+sql_quote() {
+  local s="$1"
+  printf "%s" "${s//\'/\'\'}"
+}
+
+# run sqlite statement (supports DRY_RUN)
+sqlite_exec() {
+  local sql="$1"
+  if [[ $DRY_RUN -eq 1 ]]; then
+    log 2 "DRY-RUN SQL: $sql"
+  else
+    sqlite3 "$DB" "$sql"
+  fi
+}
+
+# Ensure DB + tables exist
+ensure_db() {
+  if [[ ! -f "$DB" ]]; then
+    log 1 "Creating DB at $DB"
+  fi
+  sqlite_exec "PRAGMA journal_mode=WAL;"
+  sqlite_exec "CREATE TABLE IF NOT EXISTS projects(id INTEGER PRIMARY KEY, hash TEXT, path TEXT, git_commit TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP);"
+  sqlite_exec "CREATE TABLE IF NOT EXISTS repo_snapshots(id INTEGER PRIMARY KEY, project_hash TEXT, snapshot TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP);"
+  sqlite_exec "CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, type TEXT, data TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP);"
+  sqlite_exec "CREATE TABLE IF NOT EXISTS ai_data(id INTEGER PRIMARY KEY, repo_hash TEXT, layer TEXT, data_hash TEXT, content TEXT, meta TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP);"
+  sqlite_exec "CREATE INDEX IF NOT EXISTS idx_ai_repo_layer ON ai_data(repo_hash,layer);"
+}
+
+# compute sha256 of a file
+file_sha256() {
+  local f="$1"
+  sha256sum "$f" | awk '{print $1}'
+}
+
+# compute combined hash of a directory: sorted list of file hashes -> hash
+dir_snapshot_and_hash() {
+  local path="$1"
+  # produce "path||sha256" per file, sorted
+  find "$path" -type f -print0 | sort -z | xargs -0 -n1 -I{} bash -c 'echo -n "{}||"; sha256sum "{}" | cut -d" " -f1; echo' | sort
+}
+
+# ------------------------
+# Commands
+# ------------------------
+attach_code() {
+  local file="$1"
+  [[ -f "$file" ]] || die "File not found: $file"
+  local qfile
+  qfile=$(sql_quote "$file")
+  sqlite_exec "INSERT INTO events(type,data) VALUES('code_attach','$qfile');"
+  log 1 "Attached code: $file"
+}
+
+ingest_repo_offline() {
+  local path="$1"
+  [[ -d "$path" ]] || die "Directory not found: $path"
+  ensure_db
+
+  # git-aware
+  local git_commit=""
+  if [[ -d "$path/.git" ]]; then
+    if command -v git >/dev/null 2>&1; then
+      git_commit=$(git -C "$path" rev-parse --verify HEAD 2>/dev/null || true)
+      log 2 "Detected git commit: $git_commit"
+    fi
+  fi
+
+  log 1 "Computing snapshot for $path (this can take a while for large repos)..."
+  local snapshot
+  snapshot=$(dir_snapshot_and_hash "$path")
+  local repo_hash
+  repo_hash=$(printf '%s' "$snapshot" | sha256sum | awk '{print $1}')
+  log 2 "Computed repo hash: $repo_hash"
+
+  # store project
+  local qpath qhash qcommit qsnap
+  qpath=$(sql_quote "$path")
+  qhash=$(sql_quote "$repo_hash")
+  qcommit=$(sql_quote "$git_commit")
+  qsnap=$(sql_quote "$snapshot")
+
+  sqlite_exec "INSERT INTO projects(hash,path,git_commit) VALUES('$qhash','$qpath','$qcommit');"
+  sqlite_exec "INSERT INTO repo_snapshots(project_hash,snapshot) VALUES('$qhash','$qsnap');"
+  sqlite_exec "INSERT INTO events(type,data) VALUES('repo_ingest','$(sql_quote "ingest:$path:$repo_hash")');"
+
+  log 1 "Ingested repo: $path -> $repo_hash (git: ${git_commit:-none})"
+}
+
+# Add AI data entry (content is raw; stored as single-quoted escaped text)
+prepare_ai_data() {
+  local repo_hash="$1"
+  local layer="$2"
+  local content_file="$3"
+  [[ -f "$content_file" ]] || die "Content file not found: $content_file"
+  ensure_db
+  local content
+  content=$(<"$content_file")
+  local data_hash
+  data_hash=$(printf '%s' "$content" | sha256sum | awk '{print $1}')
+  local qrepo qlayer qhash qcontent
+  qrepo=$(sql_quote "$repo_hash")
+  qlayer=$(sql_quote "$layer")
+  qhash=$(sql_quote "$data_hash")
+  qcontent=$(sql_quote "$content")
+  sqlite_exec "INSERT INTO ai_data(repo_hash,layer,data_hash,content) VALUES('$qrepo','$qlayer','$qhash','$qcontent');"
+  log 1 "Added ai_data: repo=$repo_hash layer=$layer hash=$data_hash"
+}
+
+# Compile source/directory
+compile_source() {
+  local target="$1"
+  [[ -e "$target" ]] || die "Target not found: $target"
+  log 1 "Compiling $target..."
+  if [[ -d "$target" ]]; then
+    (cd "$target" && make)
+  elif [[ "$target" == *.c ]]; then
+    gcc -o "${target%.c}" "$target"
+  elif [[ "$target" == *.cpp || "$target" == *.cc || "$target" == *.cxx ]]; then
+    g++ -o "${target%.*}" "$target"
+  elif [[ "$target" == *.java ]]; then
+    javac "$target"
+  else
+    die "No compile rule for $target"
+  fi
+  log 1 "Compile finished: $target"
+}
+
+# Debug source
+debug_source() {
+  local file="$1"
+  [[ -f "$file" ]] || die "File not found: $file"
+  case "$file" in
+    *.c|*.cpp)
+      local bin="${file%.*}"
+      [[ -f "$bin" ]] || die "Binary not found. Compile first."
+      gdb "$bin"
+      ;;
+    *.py) python3 -m pdb "$file" ;;
+    *.js) node inspect "$file" ;;
+    *) die "No debug rule for $file" ;;
+  esac
+}
+
+# list projects, snapshots, ai_data
+list_projects() {
+  ensure_db
+  sqlite3 "$DB" "SELECT id,hash,path,git_commit,timestamp FROM projects ORDER BY id DESC;"
+}
+list_snapshots() {
+  ensure_db
+  sqlite3 "$DB" "SELECT id,project_hash,substr(snapshot,1,200) || '...' as snapshot_preview,timestamp FROM repo_snapshots ORDER BY id DESC;"
+}
+list_ai() {
+  ensure_db
+  sqlite3 "$DB" "SELECT id,repo_hash,layer,data_hash,substr(content,1,200) || '...' as content_preview,timestamp FROM ai_data ORDER BY id DESC LIMIT 200;"
+}
+
+# qbit DSL eval -> returns JSON-like superposition to stdout and optionally stores in ai_data
+qbit_eval_and_store() {
+  # usage: qbit_eval_and_store "<expr>" <repo_hash> <layer> <meta-json-optional>
+  local expr="$1"
+  local repo_hash="${2:-}"
+  local layer="${3:-}"
+  local meta="${4:-}"
+  ensure_db
+
+  # Use python for parsing the small DSL robustly and emit JSON once
+  local result
+  result=$(python3 - "$expr" <<'PY' || die "qbit eval failed"
+import sys, json, re
+expr = sys.argv[1]
+
+# Very small parser for the DSL you provided. This is intentionally narrow:
+tok_re = re.compile(r"(\|\||&&|\?\:|[?:+\-\(\)]|[~.]|[0-1]|\bjs\b|\bcss\b|\bxml\b|\bdom\b|\bnode\b|\*|\w+)")
+toks = tok_re.findall(expr)
+# heuristics to build superposition: treat + and || as amplitude addition,
+# - as subtraction (phase flip), ? : as selector between left and right
+# '.' and '~' become special symbols representing |.> and |~>
+# For simplicity produce mapping symbol->amplitude (real-valued)
+amplitudes = {}
+def add_amp(k,v):
+    amplitudes[k] = amplitudes.get(k,0) + v
+
+i = 0
+def consume():
+    global i
+    v = toks[i] if i < len(toks) else None
+    i += 1
+    return v
+
+i = 0
+stack = []
+while i < len(toks):
+    tk = consume()
+    if tk in ['+', '||']:
+        left = stack.pop() if stack else '_'
+        right = consume()
+        add_amp(left, 1)
+        add_amp(right, 1)
+        stack.append(f"({left}+{right})")
+    elif tk == '-':
+        left = stack.pop() if stack else '_'
+        right = consume()
+        add_amp(left, 1)
+        add_amp(right, -1)
+        stack.append(f"({left}-{right})")
+    elif tk == '?':
+        cond = stack.pop() if stack else consume()
+        tr = consume()
+        colon = consume()  # should be ':'
+        fl = consume()
+        add_amp(tr, 0.6)
+        add_amp(fl, 0.4)
+        stack.append(f"if({cond},{tr},{fl})")
+    elif tk == '&&':
+        left = stack.pop() if stack else '_'
+        right = consume()
+        sym = f"{left}&&{right}"
+        add_amp(sym, 1)
+        stack.append(sym)
+    elif tk in ['~', '.','*','js','css','xml','dom','node','0','1'] or re.match(r'^\w+$', tk):
+        stack.append(tk)
+    else:
+        stack.append(tk)
+
+for s in stack:
+    if isinstance(s,str):
+        if s.startswith('(') or 'if(' in s or '&&' in s:
+            continue
+        add_amp(s,1)
+
+norm = sum(v*v for v in amplitudes.values())**0.5
+probs = {k:(abs(v)/norm if norm>0 else 0) for k,v in amplitudes.items()}
+
+out = {"expr": expr, "amplitudes": amplitudes, "probabilities": probs}
+print(json.dumps(out))
+PY
+)
+
+  if [[ -n "$repo_hash" && -n "$layer" ]]; then
+    # store result in ai_data
+    local data_hash
+    data_hash=$(printf '%s' "$result" | sha256sum | awk '{print $1}')
+    local qrepo qlayer qhash qcontent qmeta
+    qrepo=$(sql_quote "$repo_hash")
+    qlayer=$(sql_quote "$layer")
+    qhash=$(sql_quote "$data_hash")
+    qcontent=$(sql_quote "$result")
+    qmeta=$(sql_quote "$meta")
+    sqlite_exec "INSERT INTO ai_data(repo_hash,layer,data_hash,content,meta) VALUES('$qrepo','$qlayer','$qhash','$qcontent','$qmeta');"
+    log 1 "Stored qbit result -> repo=$repo_hash layer=$layer data_hash=$data_hash"
+  else
+    printf '%s\n' "$result"
+  fi
+}
+
+show_help() {
+  cat <<EOF
+Usage: $CLI_NAME [flags] <command> [args...]
+
+Flags:
+  --dry-run           Show actions without executing
+  -v, -vv, -vvv       Increase verbosity
+
+Commands:
+  attach <file>                     Attach a code file (records in events)
+  ingest <path>                     Ingest a repo/directory offline (snapshot + hash)
+  compile <target>                  Compile file or run 'make' in dir
+  debug <file>                      Debug file (gdb/pdb/node)
+  prepare <repo_hash> <layer> <file>  Prepare ai_data entry from file into layer
+  qbit "<expr>" [repo_hash layer meta] Evaluate qbit DSL; optionally store in ai_data
+  list projects                      List ingested projects
+  list snapshots                     List stored snapshots
+  list ai                            List ai_data entries
+  help                               Show this help
+
+Layers should be one of: daytime, corners, sides, frames, poles
+EOF
+}
+
+# ------------------------
+# CLI parser
+# ------------------------
+if [[ $# -lt 1 ]]; then
+  show_help
+  exit 0
+fi
+
+# simple flags parse for -v / --dry-run
+while [[ $# -gt 0 && "$1" =~ ^- ]]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1; shift ;;
+    -v) VERBOSE=1; shift ;;
+    -vv) VERBOSE=2; shift ;;
+    -vvv) VERBOSE=3; shift ;;
+    -h|--help) show_help; exit 0 ;;
+    *) break ;;
+  esac
+done
+
+cmd="$1"; shift || true
+
+case "$cmd" in
+  attach) attach_code "$@" ;;
+  ingest) ingest_repo_offline "$@" ;;
+  compile) compile_source "$@" ;;
+  debug) debug_source "$@" ;;
+  prepare) prepare_ai_data "$@" ;;
+  qbit)
+      if [[ $# -lt 1 ]]; then die "qbit requires an expression argument"; fi
+      expr="$1"; shift
+      qrepo="${1:-}"; qlayer="${2:-}"; qmeta="${3:-}"
+      qbit_eval_and_store "$expr" "$qrepo" "$qlayer" "$qmeta"
+      ;;
+  list)
+      case "${1:-}" in
+        projects) list_projects ;;
+        snapshots) list_snapshots ;;
+        ai) list_ai ;;
+        *) die "Unknown list target: ${1:-}";;
+      esac
+      ;;
+  help) show_help ;;
+  *) die "Unknown command: $cmd";;
+esac

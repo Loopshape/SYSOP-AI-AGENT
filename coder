@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# AI Autonomic Synthesis Platform v50.0 (The Architect Ultimate)
+# Mandatory execution: ~/bin/ai
+set -euo pipefail
+IFS=$'\n\t'
+
+# =========================
+# 1. ENVIRONMENT & PATHS
+# =========================
+AI_HOME="${AI_HOME:-$HOME/.local_ai}"
+PROJECTS_DIR="$AI_HOME"
+LOG_DIR="$AI_HOME/logs"
+TMP_DIR="$AI_HOME/tmp"
+SWAP_DIR="$AI_HOME/swap"
+CORE_DB="$AI_HOME/agent_core.db"
+TASK_DB="$AI_HOME/ai_task_manager.db"
+LOG_FILE="$LOG_DIR/system.log"
+HMAC_SECRET_KEY="$AI_HOME/secret.key"
+WALLET_MNEMONIC="${WALLET_MNEMONIC:-}"
+
+# =========================
+# 2. AI MODELS & AGENT PARAMS
+# =========================
+MODELS=("core" "coin" "code" "loop" "2244")
+MAX_AGENT_LOOPS=${MAX_AGENT_LOOPS:-12}
+MAX_RAM_BYTES=2097152
+
+# =========================
+# 3. COLORS & ICONS
+# =========================
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'
+PURPLE='\033[0;35m'; CYAN='\033[0;36m'; ORANGE='\033[0;33m'; NC='\033[0m'
+ICON_SUCCESS="✅"; ICON_WARN="⚠️"; ICON_ERROR="❌"; ICON_INFO="ℹ️"; ICON_TASK="📝"
+
+# =========================
+# 4. LOGGING
+# =========================
+mkdir -p "$LOG_DIR" "$TMP_DIR" "$SWAP_DIR"
+
+log_to_file(){ echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"; }
+log_msg(){ local clr="$1" icon="$2" lvl="$3" msg="$4"; echo -e "${clr}[$lvl][${icon}] $(date '+%T') $msg${NC}"; log_to_file "[$lvl] $msg"; }
+log_info(){ log_msg "$BLUE" "$ICON_INFO" "INFO" "$1"; }
+log_warn(){ log_msg "$YELLOW" "$ICON_WARN" "WARN" "$1"; }
+log_error(){ log_msg "$RED" "$ICON_ERROR" "ERROR" "$1"; }
+log_success(){ log_msg "$GREEN" "$ICON_SUCCESS" "SUCCESS" "$1"; }
+log_task(){ log_msg "$ORANGE" "$ICON_TASK" "TASK" "$1"; }
+
+# =========================
+# 5. HASH FUNCTIONS
+# =========================
+hash_string(){ echo -n "$1" | sha256sum | awk '{print $1}'; }
+hash_string_salt(){ echo -n "$1${2:-salt}" | sha256sum | awk '{print $1}'; }
+hash_file(){ local f="$1"; local algo="${2:-sha256}"; case "$algo" in sha256) sha256sum "$f" | awk '{print $1}' ;; sha512) sha512sum "$f" | awk '{print $1}' ;; md5) md5sum "$f" | awk '{print $1}' ;; esac }
+hash_dir(){ find "$1" -type f -exec sha256sum {} + | sort | sha256sum | awk '{print $1}'; }
+
+# =========================
+# 6. DATABASE INIT
+# =========================
+sqlite_escape(){ echo "$1" | sed "s/'/''/g"; }
+
+init_task_db(){
+    [[ -f "$TASK_DB" ]] || sqlite3 "$TASK_DB" <<SQL
+CREATE TABLE projects (hash TEXT PRIMARY KEY, path TEXT NOT NULL, ts DATETIME DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE file_hashes (project_hash TEXT, file_path TEXT, file_hash TEXT, rehashed INTEGER DEFAULT 0, PRIMARY KEY(project_hash,file_path));
+CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts DATETIME DEFAULT CURRENT_TIMESTAMP, type TEXT, data TEXT);
+SQL
+}
+
+init_core_db(){
+    [[ -f "$CORE_DB" ]] || sqlite3 "$CORE_DB" <<SQL
+CREATE TABLE memories (id INTEGER PRIMARY KEY, prompt_hash TEXT, prompt TEXT, response_ref TEXT);
+CREATE TABLE tool_logs (id INTEGER PRIMARY KEY, task_id TEXT, tool_name TEXT, args TEXT, result TEXT);
+SQL
+}
+
+# =========================
+# 7. UTILITY FUNCTIONS
+# =========================
+store_output_fast(){ local c="$1" h; h=$(hash_string "$c"); if ((${#c}>MAX_RAM_BYTES)); then f="$SWAP_DIR/$h.txt.gz"; echo "$c"|gzip>"$f"; echo "$f"; else echo "$c"; fi; }
+retrieve_output_fast(){ local r="$1"; [[ -f "$r" ]] && ([[ "$r" == *.gz ]] && gzip -dc "$r" || cat "$r") || echo "$r"; }
+
+calculate_hmac(){ local data="$1"; [[ -f "$HMAC_SECRET_KEY" ]] && secret=$(<"$HMAC_SECRET_KEY") || secret="default-secret"; echo -n "$data" | openssl dgst -sha256 -hmac "$secret" | awk '{print $2}'; }
+
+confirm_action(){ read -p "$(echo -e "${YELLOW}PROPOSED ACTION:${NC} $1\nApprove? [y/N] ")" -n 1 -r c || true; echo; [[ "${c:-}" =~ ^[Yy]$ ]]; }
+
+# =========================
+# 8. PROJECT MANAGEMENT
+# =========================
+ingest_repo(){ local repo="$1"; [[ -d "$repo" ]] || { log_error "Repo not found: $repo"; return 1; }; local hash=$(hash_string "$repo"); sqlite3 "$TASK_DB" "INSERT OR IGNORE INTO projects(hash,path) VALUES('$(sqlite_escape "$hash")','$(sqlite_escape "$repo")');"; find "$repo" -type f | while read -r f; do fh=$(hash_file "$f"); sqlite3 "$TASK_DB" "INSERT OR REPLACE INTO file_hashes(project_hash,file_path,file_hash,rehashed) VALUES('$(sqlite_escape "$hash")','$(sqlite_escape "$f")','$fh',0);"; done; log_task "Repo ingested: $repo -> $hash"; echo "$hash"; }
+
+rehash_repo_files(){ local hash="$1"; find "$(sqlite3 "$TASK_DB" "SELECT path FROM projects WHERE hash='$(sqlite_escape "$hash")' LIMIT 1;")" -type f | while read -r f; do fh=$(hash_file "$f"); sqlite3 "$TASK_DB" "UPDATE file_hashes SET file_hash='$fh', rehashed=1 WHERE project_hash='$(sqlite_escape "$hash")' AND file_path='$(sqlite_escape "$f")';"; done; log_task "Rehash completed for $hash"; }
+
+# =========================
+# 9. FILE PARSING & MIME HANDLING
+# =========================
+process_file(){
+    local f="$1"
+    local mimetype
+    mimetype=$(file --mime-type -b "$f")
+    case "$mimetype" in
+        text/*) log_info "Text file: $f";;
+        image/*) log_info "Image file: $f";;
+        application/zip) log_info "Archive: $f";;
+        *) log_info "Other file: $f";;
+    esac
+}
+
+# =========================
+# 10. WALLET & BTC SIM
+# =========================
+wallet_cli_connect(){
+    [[ -z "$WALLET_MNEMONIC" ]] && { log_warn "No wallet mnemonic set."; return 1; }
+    log_info "Wallet connected (mnemonic provided)"
+}
+
+btc_analyze(){
+    log_task "Simulating BTC market analysis..."
+    echo "BTC/USD market analysis generated (simulation)"
+}
+
+btc_trade(){
+    local action="$1"
+    log_task "Simulated BTC $action executed"
+}
+
+# =========================
+# 11. AGI WORKFLOW
+# =========================
+run_agi_workflow(){
+    local prompt="$*"
+    local task_id=$(hash_string "$prompt$(date +%s%N)" | cut -c1-16)
+    local workspace="$PROJECTS_DIR/task-$task_id"
+    mkdir -p "$workspace"
+    log_success "Project workspace: $workspace (Task ID: $task_id)"
+
+    local loop=1 conversation_history="$prompt"
+    while [[ $loop -le $MAX_AGENT_LOOPS ]]; do
+        log_info "AGI Loop $loop/$MAX_AGENT_LOOPS"
+
+        for model in "${MODELS[@]}"; do
+            log_info "[$model] thinking..."
+            sleep 0.1 # simulate thinking
+        done
+
+        loop=$((loop+1))
+    done
+
+    log_success "AGI workflow complete"
+}
+
+# =========================
+# 12. MAIN DISPATCHER
+# =========================
+main(){
+    init_task_db
+    init_core_db
+    mkdir -p "$PROJECTS_DIR"
+
+    local cmd="${1:-}"
+
+    case "$cmd" in
+        -h|--help|help)
+            cat <<EOF
+Usage: ai <command> [options]
+
+Commands:
+  <prompt>             Run AGI workflow
+  ingest <path>        Ingest project
+  rehash <hash>        Rehash project files
+  btc analyze          BTC market analysis
+  btc buy|sell         Simulate BTC trade
+  wallet connect       Connect wallet via mnemonic
+EOF
+            ;;
+        ingest)
+            shift
+            ingest_repo "$@"
+            ;;
+        rehash)
+            shift
+            rehash_repo_files "$@"
+            ;;
+        btc)
+            shift
+            case "$1" in
+                analyze) btc_analyze ;;
+                buy|sell) btc_trade "$1" ;;
+                *) log_warn "Unknown btc command" ;;
+            esac
+            ;;
+        wallet)
+            shift
+            case "$1" in connect) wallet_cli_connect ;; *) log_warn "Unknown wallet command" ;; esac
+            ;;
+        *)
+            run_agi_workflow "$*"
+            ;;
+    esac
+}
+
+# =========================
+# 13. SCRIPT ENTRY POINT
+# =========================
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

@@ -1,0 +1,127 @@
+#!/usr/bin/env python3
+"""
+GitAgent for 2244-1 (infinite monitoring)
+- Monitors a Git repo for new commits
+- Analyzes new commits with 2244-1
+- Logs everything in workspace
+- NAT-aware
+- Termux/PRoot/Linux compatible
+"""
+
+import os
+import sys
+import subprocess
+import time
+import uuid
+import socket
+
+# Auto-install modules
+REQUIRED_MODULES = ["termcolor", "requests"]
+
+def ensure_modules():
+    import importlib
+    for module in REQUIRED_MODULES:
+        try:
+            importlib.import_module(module)
+        except ImportError:
+            print(f"⚠️ Installing missing module '{module}'...")
+            subprocess.check_call([sys.executable, "-m", "pip", "install", module])
+
+ensure_modules()
+
+from termcolor import colored
+import requests
+
+# Backend client
+class OllamaClient:
+    def __init__(self, host="http://localhost:11434", timeout=60):
+        self.host = host.rstrip("/")
+        self.timeout = timeout
+
+    def run(self, model: str, prompt: str):
+        url = f"{self.host}/api/generate"
+        payload = {"model": model, "prompt": prompt}
+        try:
+            r = requests.post(url, json=payload, timeout=self.timeout)
+            r.raise_for_status()
+            return r.json().get("response", "")
+        except Exception as e:
+            return f"⚠️ Ollama call failed: {e}"
+
+class NetResolver:
+    @staticmethod
+    def detect_nat():
+        try:
+            ip = socket.gethostbyname(socket.gethostname())
+            return ip
+        except Exception:
+            return "127.0.0.1"
+
+class GitAgent:
+    def __init__(self, repo_url):
+        self.repo_url = repo_url
+        self.repo_name = os.path.basename(repo_url.rstrip("/")).replace(".git","")
+        self.workspace = os.path.expanduser(f"~/ai_projects/gitagent_{self.repo_name}")
+        os.makedirs(self.workspace, exist_ok=True)
+        self.repo_path = os.path.join(self.workspace, self.repo_name)
+        self.client = OllamaClient()
+        self.resolver = NetResolver()
+        self.log_file = os.path.join(self.workspace, "gitagent.log")
+        self.known_commits = set()
+        self.clone_or_update_repo()
+
+    def log(self, msg, color="white"):
+        ts = time.strftime("[%H:%M:%S]")
+        line = f"{ts} {msg}"
+        print(colored(line, color))
+        with open(self.log_file, "a") as f:
+            f.write(line + "\n")
+
+    def clone_or_update_repo(self):
+        if not os.path.exists(self.repo_path):
+            self.log(f"Cloning repository {self.repo_url}...", "yellow")
+            subprocess.run(["git", "clone", self.repo_url], cwd=self.workspace)
+        else:
+            self.log(f"Fetching latest changes for {self.repo_name}...", "yellow")
+            subprocess.run(["git", "fetch", "--all"], cwd=self.repo_path)
+
+        # Track existing commits to avoid re-analysis
+        result = subprocess.check_output(["git", "log", "--pretty=format:%H"], cwd=self.repo_path)
+        self.known_commits = set(result.decode().splitlines())
+
+    def get_new_commits(self):
+        result = subprocess.check_output(["git", "log", "--pretty=format:%H"], cwd=self.repo_path)
+        commits = set(result.decode().splitlines())
+        return commits - self.known_commits
+
+    def analyze_commit(self, commit_hash):
+        diff = subprocess.check_output(["git", "show", commit_hash], cwd=self.repo_path).decode()
+        prompt = f"Analyze the following Git commit diff:\n{diff}"
+        reply = self.client.run("2244-1", prompt)
+        self.log(f"Commit {commit_hash} analysis:\n{reply}", "cyan")
+
+    def run(self):
+        self.log("Activating GitAgent for 2244-1 (infinite monitoring)", "magenta")
+        local_ip = self.resolver.detect_nat()
+        self.log(f"Local IP: {local_ip}", "cyan")
+        self.log(f"Monitoring repository: {self.repo_url}", "green")
+
+        try:
+            while True:
+                new_commits = self.get_new_commits()
+                if new_commits:
+                    self.log(f"Found {len(new_commits)} new commit(s)", "yellow")
+                    for commit in sorted(new_commits):
+                        self.analyze_commit(commit)
+                        self.known_commits.add(commit)
+                else:
+                    self.log("No new commits, waiting...", "blue")
+                time.sleep(10)  # check every 10 seconds
+                subprocess.run(["git", "fetch", "--all"], cwd=self.repo_path)
+        except KeyboardInterrupt:
+            self.log("GitAgent stopped manually (Ctrl+C)", "red")
+
+if __name__ == "__main__":
+    repo_url = "https://github.com/OPCODEX0A/0xA.git"
+    agent = GitAgent(repo_url)
+    agent.run()
